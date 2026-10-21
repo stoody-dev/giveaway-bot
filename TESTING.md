@@ -131,3 +131,4 @@ Output highlights missing required secrets (`DISCORD_BOT_TOKEN`, `TURSO_DATABASE
    - Tests in `dashboard/smoke-api.js` require Node.js runtime environment. When running in a Python-only worker container, dashboard tests are deferred to the Vercel deploy pipeline.
 3. **Redis Integration Testing**:
    - `test_redis_cache.py` uses high-fidelity fake Redis clients mimicking Redis command semantics, timing, connection drops, and pipeline responses. Live Redis benchmark can be executed via `bot/bench_redis.py` when `REDIS_URL` is available.
+

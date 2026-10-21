@@ -172,3 +172,4 @@ The system is designed for high-availability Discord giveaway management backed 
    - The root repository contains a Node.js dashboard backend in `dashboard/`. The local environment currently lacks `node` in its system path. Automated Python tests (372/372 passing) fully cover all Python backend operations, while Node smoke tests should be executed in CI/CD container environments where Node.js >= 20 is provisioned.
 2. **Gateway Sharding**:
    - For bots operating in over 2,500 Discord servers, `discord.ext.commands.AutoShardedBot` should be considered. For current deployment scale, `commands.Bot` with single-process gateway connection is optimal.
+

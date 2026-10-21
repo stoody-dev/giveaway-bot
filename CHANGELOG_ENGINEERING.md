@@ -117,3 +117,4 @@ If a rollback is ever necessary:
    DROP INDEX IF EXISTS idx_simple_entries_giveaway_entered;
    ```
 3. Restart the service using `python app.py`.
+
