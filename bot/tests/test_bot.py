@@ -199,6 +199,25 @@ class CommandWiringTests(BotTestCase):
         asyncio.run(self.bot._flush_message_buffer())
         self.assertEqual(self.svc.message_count(self.guild, "4" * 18), 1)
 
+    def test_a_timed_out_flush_is_not_counted_again(self) -> None:
+        # A timeout only stops the wait: the worker thread still commits. The
+        # batch must not go back in the buffer, or the next flush counts it twice.
+        asyncio.run(self.bot.on_message(fake_message(self.guild, "3" * 18)))
+        original = self.bot.service.add_message_counts
+
+        def slow(rows):
+            time.sleep(0.3)
+            return original(rows)
+
+        self.bot.service.add_message_counts = slow
+        self.bot.DB_LONG_TIMEOUT = 0.05
+        asyncio.run(self.bot._flush_message_buffer())  # times out; must not raise
+        self.assertEqual(self.bot._message_buffer, {}, "unknown outcome: do not requeue")
+        time.sleep(0.6)  # the abandoned worker finishes its write anyway
+        self.bot.service.add_message_counts = original
+        asyncio.run(self.bot._flush_message_buffer())
+        self.assertEqual(self.svc.message_count(self.guild, "3" * 18), 1, "counted once")
+
     def test_buffer_overflow_flushes_early(self) -> None:
         self.bot.MESSAGE_BUFFER_MAX = 2
         asyncio.run(self.bot.on_message(fake_message(self.guild, "1" * 18)))
@@ -1937,7 +1956,7 @@ class RequestTimeTests(BotTestCase):
         return interaction.followup.sent[-1]
 
     def test_breakdown_names_every_live_leg(self) -> None:
-        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user(manage_guild=True))
         report = self.run_command(interaction)
         if isinstance(report, dict):
             text = report.get("content") or ""
@@ -1965,9 +1984,17 @@ class RequestTimeTests(BotTestCase):
         self.assertNotIn("database leg is measured or printed", text.replace(
             "No database leg is measured or printed", ""))
 
+    def test_a_regular_member_is_refused_and_nothing_is_written(self) -> None:
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        command = self.bot.tree.get_command("gw_request_time")
+        asyncio.run(command.callback(interaction))
+        self.assertEqual(interaction.response.sent[0]["content"], "You need **Manage Server**.")
+        self.assertEqual(interaction.followup.sent, [])
+        self.assertEqual(self.db.query("SELECT id FROM simple_giveaways"), [], "no preview row")
+
     def test_probe_says_so_when_there_is_no_redis(self) -> None:
         """No cache configured must read as absent, never as a fast zero."""
-        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user(manage_guild=True))
         report = self.run_command(interaction)
         text = report.get("content") if isinstance(report, dict) else getattr(report, "content", "")
         text = text or ""
@@ -1976,7 +2003,7 @@ class RequestTimeTests(BotTestCase):
         self.assertNotIn("HIT", text)
 
     def test_write_probe_leaves_no_row_behind(self) -> None:
-        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user(manage_guild=True))
         self.run_command(interaction)
         rows = self.db.query(
             "SELECT * FROM simple_message_counts WHERE user_id = ?",
@@ -1985,7 +2012,7 @@ class RequestTimeTests(BotTestCase):
         self.assertEqual(rows, [])
 
     def test_probe_times_lookup_and_splits_write(self) -> None:
-        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user(manage_guild=True))
         report = self.run_command(interaction)
         if isinstance(report, dict):
             text = report.get("content") or ""
@@ -2044,7 +2071,7 @@ class OffLoopReadPoolTests(BotTestCase):
         seen = self.spy_on_db_call()
         command = self.bot.tree.get_command("gw_request_time")
         self.assertIsNotNone(command)
-        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user(manage_guild=True))
         asyncio.run(command.callback(interaction))
         self.assertIn("list_active", seen, f"the probe's own read went elsewhere: {seen}")
 

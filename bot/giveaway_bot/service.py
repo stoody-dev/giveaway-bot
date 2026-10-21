@@ -1123,29 +1123,44 @@ class GiveawayService:
             applied += len(chunk)
         return applied
 
+    def _stored_counts(
+        self, chunk: list[tuple[str, str, int]]
+    ) -> dict[tuple[str, str], int] | None:
+        """Stored count for every key of a chunk, in ONE query.
+
+        A key with no row yet counts as 0. Returns None when the read fails, so
+        callers can tell "unknown" from "zero". One statement per chunk matters:
+        reading per user made a 100-user flush slower than the DB call timeout.
+        """
+        marks = ", ".join("(?, ?)" for _ in chunk)
+        params: list[Any] = []
+        for guild_id, user_id, _ in chunk:
+            params.extend((guild_id, user_id))
+        try:
+            # Interpolated text is the placeholder list only; values are bound.
+            rows = self.db.query(
+                "SELECT guild_id, user_id, count FROM simple_message_counts"  # noqa: S608
+                f" WHERE (guild_id, user_id) IN (VALUES {marks})",
+                params,
+            )
+        except Exception:
+            log.warning("flush snapshot read failed for a chunk of %d", len(chunk))
+            return None
+        out = {(guild_id, user_id): 0 for guild_id, user_id, _ in chunk}
+        for row in rows:
+            out[(str(row["guild_id"]), str(row["user_id"]))] = int(row.get("count") or 0)
+        return out
+
     def _read_counts(
         self, chunk: list[tuple[str, str, int]]
     ) -> dict[tuple[str, str], int]:
         """Stored count per key before a flush chunk runs.
 
-        Static per-key reads (no interpolated SQL): this runs once per chunk,
-        and only its result matters when the chunk later fails ambiguously.
-        Keys that cannot be read are left out — _reconcile_chunk requeues
-        those whole rather than risking silent loss.
+        Only its result matters when the chunk later fails ambiguously. When
+        the read fails the snapshot is empty, and _reconcile_chunk requeues the
+        whole chunk rather than risking silent loss.
         """
-        out: dict[tuple[str, str], int] = {}
-        for guild_id, user_id, _ in chunk:
-            try:
-                row = self.db.query_one(
-                    "SELECT count AS n FROM simple_message_counts"
-                    " WHERE guild_id = ? AND user_id = ?",
-                    (guild_id, user_id),
-                )
-            except Exception:
-                log.warning("flush snapshot read failed for %s/%s", guild_id, user_id)
-                continue
-            out[(guild_id, user_id)] = int((row or {}).get("n") or 0)
-        return out
+        return self._stored_counts(chunk) or {}
 
     def _reconcile_chunk(
         self, chunk: list[tuple[str, str, int]], before: dict[tuple[str, str], int]
@@ -1157,25 +1172,19 @@ class GiveawayService:
         cannot double-add the failed chunk. Keys that cannot be re-read are
         requeued whole: over-counting beats silently losing messages.
         """
+        stored_now = self._stored_counts(chunk)
+        if stored_now is None:
+            return list(chunk)
         shortfall: list[tuple[str, str, int]] = []
         for guild_id, user_id, delta in chunk:
-            try:
-                row = self.db.query_one(
-                    "SELECT count AS n FROM simple_message_counts"
-                    " WHERE guild_id = ? AND user_id = ?",
-                    (guild_id, user_id),
-                )
-            except Exception:
-                shortfall.append((guild_id, user_id, delta))
-                continue
-            stored = int((row or {}).get("n") or 0)
-            if (guild_id, user_id) not in before:
+            key = (guild_id, user_id)
+            if key not in before:
                 # No snapshot for this key (the pre-read failed): the stored
                 # value cannot be compared, so requeue the whole delta rather
                 # than risk silently losing messages.
                 shortfall.append((guild_id, user_id, delta))
                 continue
-            missing = before[(guild_id, user_id)] + delta - stored
+            missing = before[key] + delta - stored_now[key]
             if missing > 0:
                 shortfall.append((guild_id, user_id, missing))
         return shortfall
@@ -1862,16 +1871,30 @@ class GiveawayService:
 
         A giveaway stranded with zero pending rows never appears in due_claims,
         so per-giveaway repair alone would never visit it: this bounded sweep
-        (oldest ended first) recreates those windows, and the tick then picks
-        them up like any restart recovery. Idempotent; failures heal on a
-        later tick. Returns rows written.
+        recreates those windows, and the tick then picks them up like any
+        restart recovery. Idempotent; failures heal on a later tick. Returns
+        rows written.
+
+        The query only returns giveaways that really need repair (a winner with
+        no claim row, or a pending claim for someone no longer named). It used
+        to return the oldest N claim giveaways, healthy or not: every tick then
+        re-checked the same old rows and never reached a newer stranded one.
         """
         ts = now if now is not None else now_ms()
         try:
             rows = self.db.query(
-                "SELECT id FROM simple_giveaways WHERE status = 'ended'"
-                " AND claim_timeout_seconds > 0 AND winners_json != '[]'"
-                " ORDER BY COALESCE(ended_at, 0) ASC LIMIT ?",
+                "SELECT g.id FROM simple_giveaways AS g WHERE g.status = 'ended'"
+                " AND g.claim_timeout_seconds > 0 AND g.winners_json != '[]'"
+                # CASE keeps json_each away from a malformed winners_json.
+                " AND CASE WHEN json_valid(g.winners_json) THEN ("
+                "   EXISTS (SELECT 1 FROM json_each(g.winners_json) AS w"
+                "     WHERE NOT EXISTS (SELECT 1 FROM simple_claims AS c"
+                "       WHERE c.giveaway_id = g.id AND c.user_id = w.value))"
+                "   OR EXISTS (SELECT 1 FROM simple_claims AS c"
+                "     WHERE c.giveaway_id = g.id AND c.status = 'pending'"
+                "       AND c.user_id NOT IN (SELECT value FROM json_each(g.winners_json)))"
+                " ) ELSE 0 END"
+                " ORDER BY COALESCE(g.ended_at, 0) ASC LIMIT ?",
                 (max(1, min(int(limit), 100)),),
             )
         except Exception:
@@ -2199,21 +2222,11 @@ class GiveawayService:
     def wipe_stale_entries(self, now: int | None = None) -> int:
         """Delete entry rows for giveaways finished over 5h ago. Returns count.
 
-        Also zeroes the live counter on wiped giveaways: otherwise
-        entry_count() would keep returning the stale pre-wipe bump.
+        entrant_count is left alone on purpose: it is the record of how many
+        people entered, which the dashboard shows for finished giveaways. Only
+        the per-user rows (who entered) are personal data worth wiping.
         """
         cutoff = (now if now is not None else now_ms()) - self.ENTRY_RETENTION_MS
-        try:
-            self.db.execute(
-                "UPDATE simple_giveaways SET entrant_count = 0 WHERE status != 'active'"
-                " AND COALESCE(ended_at, created_at) <= ?"
-                " AND NOT EXISTS (SELECT 1 FROM simple_claims"
-                " WHERE simple_claims.giveaway_id = simple_giveaways.id"
-                " AND simple_claims.status = 'pending')",
-                (cutoff,),
-            )
-        except Exception:
-            pass
         cur = self.db.execute(
             # ended_at was added to a table that already held data, so giveaways
             # that finished before that migration carry NULL forever; created_at

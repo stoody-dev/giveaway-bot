@@ -382,6 +382,19 @@ class MessageCountTests(ServiceTestCase):
         self.assertEqual(self.db.query_one(
             "SELECT COUNT(*) AS n FROM simple_message_counts")["n"], 700)
 
+    def test_flush_cost_does_not_grow_with_the_number_of_users(self) -> None:
+        # Reading each user's count one by one made a busy flush slower than the
+        # database call timeout. One chunk must cost the same few statements
+        # whether it holds 2 users or 250.
+        def statements(users: int) -> int:
+            rows = [(self.guild, f"s{users}_{i:05d}", 1) for i in range(users)]
+            before = self.db.get_stats()
+            self.svc.add_message_counts(rows)
+            after = self.db.get_stats()
+            return (after["reads"] + after["writes"]) - (before["reads"] + before["writes"])
+
+        self.assertEqual(statements(250), statements(2))
+
     def test_ambiguous_chunk_failure_requeues_only_what_is_missing(self) -> None:
         # The write landed but its response was lost: the retry must not add
         # the chunk a second time.
@@ -650,9 +663,21 @@ class RetentionTests(ServiceTestCase):
             (now_ms() - self.svc.ENTRY_RETENTION_MS - 60_000, old.id),
         )
         self.svc.wipe_stale_entries()
-        self.assertEqual(self.svc.entry_count(old.id), 0, "old entry rows are gone")
-        self.assertEqual(self.svc.entry_count(fresh.id), 1, "recent ones are kept")
+        self.assertEqual(self.svc.entry_count(old.id, exact=True), 0, "old entry rows are gone")
+        self.assertEqual(self.svc.entry_count(fresh.id, exact=True), 1, "recent ones are kept")
         self.assertEqual(len(self.svc.get(old.id).winners), 1, "the record and winners stay")
+
+    def test_the_wipe_keeps_how_many_people_entered(self) -> None:
+        # The dashboard shows this number for finished giveaways; wiping the
+        # who-entered rows must not turn "27 entrants" into "No entries yet".
+        gw = self.make()
+        for i in range(27):
+            self.join(gw, user_id=str(10 ** 17 + i))
+        self.svc.end(gw.id)
+        self.assertEqual(self.svc.wipe_stale_entries(now=now_ms() + 10 * DAY_MS), 27)
+        row = self.db.query_one("SELECT entrant_count FROM simple_giveaways WHERE id = ?", (gw.id,))
+        self.assertEqual(row["entrant_count"], 27)
+        self.assertEqual(self.svc.entry_count(gw.id), 27)
 
 
     def test_rows_without_an_ended_at_still_expire(self) -> None:
@@ -992,6 +1017,43 @@ class ClaimTests(ServiceTestCase):
         self.assertEqual(len(winners), 1)
         self.assertIn(winners[0], users)
         return ended, winners[0], users
+
+    def test_repair_sweep_finds_a_stranded_giveaway_among_many_healthy_ones(self) -> None:
+        # The sweep used to re-check the 25 oldest claim giveaways forever and
+        # never reached a newer one.
+        for _ in range(30):
+            self._three_entrant_ended()
+        stranded, _winner, _users = self._three_entrant_ended()
+        self.db.execute("DELETE FROM simple_claims WHERE giveaway_id = ?", (stranded.id,))
+        self.assertEqual(self.svc.repair_all_missing_claims(), 1)
+        rows = self.db.query(
+            "SELECT status FROM simple_claims WHERE giveaway_id = ?", (stranded.id,)
+        )
+        self.assertEqual([r["status"] for r in rows], ["pending"])
+
+    def test_repair_sweep_costs_one_query_when_nothing_is_stranded(self) -> None:
+        for _ in range(30):
+            self._three_entrant_ended()
+        before = self.db.get_stats()
+        self.assertEqual(self.svc.repair_all_missing_claims(), 0)
+        after = self.db.get_stats()
+        used = (after["reads"] + after["writes"]) - (before["reads"] + before["writes"])
+        self.assertEqual(used, 1)
+
+    def test_repair_sweep_closes_a_pending_claim_for_someone_no_longer_a_winner(self) -> None:
+        ended, winner, users = self._three_entrant_ended()
+        other = next(u for u in users if u != winner)
+        self.db.execute(
+            "INSERT INTO simple_claims (giveaway_id, user_id, round, status, deadline_ms,"
+            " created_at) VALUES (?, ?, 0, 'pending', ?, ?)",
+            (ended.id, other, now_ms() + 1000, now_ms()),
+        )
+        self.svc.repair_all_missing_claims()
+        row = self.db.query_one(
+            "SELECT status FROM simple_claims WHERE giveaway_id = ? AND user_id = ?",
+            (ended.id, other),
+        )
+        self.assertEqual(row["status"], "replaced")
 
     def test_create_validates_claim_window(self) -> None:
         for bad in (-1, 60 * 86400 + 1):

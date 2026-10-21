@@ -119,12 +119,17 @@ def start_health_server(
                 except Exception:
                     status = "starting"
                 online = status == "online"
+                suffix = (
+                    " (ready)"
+                    if online
+                    else " (bot not ready — Discord commands appear once the gateway connects)"
+                )
                 body = (
                     "giveaway-bot: "
                     + ("online — gateway connected" if online else status)
-                    + " discord=" + _discord_state()
-                    + " (bot not ready" if not online else " (ready)"
-                    + " — Discord commands appear once the gateway connects)"
+                    + " discord="
+                    + _discord_state()
+                    + suffix
                 ).encode()
                 self._respond(200, body)
             else:

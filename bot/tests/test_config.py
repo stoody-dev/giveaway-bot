@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 from giveaway_bot.config import get_settings
 
@@ -73,6 +74,49 @@ class DashboardUrlTests(unittest.TestCase):
     def test_custom_value_is_used(self) -> None:
         os.environ["DASHBOARD_URL"] = " https://example.com/ "
         self.assertEqual(get_settings().dashboard_url, "https://example.com/")
+
+
+class HelperAndClampTests(unittest.TestCase):
+    def test_bool_helper(self) -> None:
+        from giveaway_bot.config import _bool
+
+        with patch.dict(os.environ, {"FLAG": "true"}):
+            self.assertTrue(_bool("FLAG", False))
+        with patch.dict(os.environ, {"FLAG": "1"}):
+            self.assertTrue(_bool("FLAG", False))
+        with patch.dict(os.environ, {"FLAG": "yes"}):
+            self.assertTrue(_bool("FLAG", False))
+        with patch.dict(os.environ, {"FLAG": "on"}):
+            self.assertTrue(_bool("FLAG", False))
+
+        with patch.dict(os.environ, {"FLAG": "false"}):
+            self.assertFalse(_bool("FLAG", True))
+        with patch.dict(os.environ, {"FLAG": "0"}):
+            self.assertFalse(_bool("FLAG", True))
+        with patch.dict(os.environ, {"FLAG": "no"}):
+            self.assertFalse(_bool("FLAG", True))
+        with patch.dict(os.environ, {"FLAG": "off"}):
+            self.assertFalse(_bool("FLAG", True))
+
+        with patch.dict(os.environ, {"FLAG": "invalid"}):
+            self.assertTrue(_bool("FLAG", True))
+            self.assertFalse(_bool("FLAG", False))
+
+    def test_int_helper(self) -> None:
+        from giveaway_bot.config import _int
+
+        with patch.dict(os.environ, {"NUM": "42"}):
+            self.assertEqual(_int("NUM", 10), 42)
+        with patch.dict(os.environ, {"NUM": "notanumber"}):
+            self.assertEqual(_int("NUM", 10), 10)
+        with patch.dict(os.environ, {"NUM": ""}):
+            self.assertEqual(_int("NUM", 10), 10)
+
+    def test_tick_seconds_clamped(self) -> None:
+        with patch.dict(os.environ, {"TICK_SECONDS": "2"}):
+            self.assertEqual(get_settings().tick_seconds, 5)
+        with patch.dict(os.environ, {"TICK_SECONDS": "45"}):
+            self.assertEqual(get_settings().tick_seconds, 45)
 
 
 if __name__ == "__main__":

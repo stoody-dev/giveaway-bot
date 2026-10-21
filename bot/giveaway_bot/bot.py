@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import logging
 import random
 import re
@@ -172,6 +173,9 @@ class GiveawayBot(commands.Bot):
     #: stream must never park a click (or a lane) forever.
     DB_CALL_TIMEOUT = 8.0
 
+    #: For calls that run many statements back to back (see _db_call).
+    DB_LONG_TIMEOUT = 60.0
+
     #: Leading-edge refresh window in seconds (see _refresh_stamp above).
     REFRESH_DEBOUNCE_SECONDS = 2.0
 
@@ -207,15 +211,21 @@ class GiveawayBot(commands.Bot):
             log.debug("cache invalidation flush failed", exc_info=True)
 
 
-    async def _db_call(self, func, *args, **kwargs):
-        """Run a blocking service/DB call on the pinned pool, gated."""
+    async def _db_call(self, func, *args, _timeout: float | None = None, **kwargs):
+        """Run a blocking service/DB call on the pinned pool, gated.
+
+        A timeout only stops the WAIT: the worker thread keeps running and may
+        still commit. Calls that run many statements in a row (a draw, a flush,
+        a ban sweep) therefore pass DB_LONG_TIMEOUT, so a slow link does not
+        turn a successful write into a reported failure.
+        """
         loop = asyncio.get_running_loop()
         pool = self._pool()
         async with self._db_gate:
             try:
                 return await asyncio.wait_for(
                     loop.run_in_executor(pool, lambda: func(*args, **kwargs)),
-                    timeout=self.DB_CALL_TIMEOUT,
+                    timeout=self.DB_CALL_TIMEOUT if _timeout is None else _timeout,
                 )
             except TimeoutError:
                 log.warning("db call %s timed out", getattr(func, "__name__", func))
@@ -428,9 +438,19 @@ class GiveawayBot(commands.Bot):
         try:
             task = asyncio.get_running_loop().create_task(coro)
         except RuntimeError:
+            with contextlib.suppress(Exception):
+                coro.close()
             return
         self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
+
+        def _on_done(t: asyncio.Task) -> None:
+            self._bg_tasks.discard(t)
+            if not t.cancelled():
+                exc = t.exception()
+                if exc is not None:
+                    log.error("background task failed: %s", exc, exc_info=exc)
+
+        task.add_done_callback(_on_done)
 
     async def close(self) -> None:
         for loop in (self.tick, self.heartbeat, self.flush_messages):
@@ -681,7 +701,15 @@ class GiveawayBot(commands.Bot):
         batch, self._message_buffer = self._message_buffer, {}
         rows = [(guild_id, user_id, n) for (guild_id, user_id), n in batch.items()]
         try:
-            await self._db_call(self.service.add_message_counts, rows)
+            await self._db_call(
+                self.service.add_message_counts, rows, _timeout=self.DB_LONG_TIMEOUT
+            )
+        except TimeoutError:
+            # We stopped waiting, but the worker thread is still writing and may
+            # commit every chunk. Putting the batch back would count it twice;
+            # losing it only under-counts, and an under-count fails closed (a
+            # member is asked to send a few more messages).
+            log.warning("message-count flush timed out; dropping %d buffered count(s)", len(rows))
         except PartialFlush as exc:
             # The chunks before the failure are already stored, so only the tail
             # goes back: restoring the whole batch would write the committed head
@@ -837,7 +865,10 @@ class GiveawayBot(commands.Bot):
 
             for start in range(0, len(entrants), self.STRIP_BATCH):
                 window = entrants[start : start + self.STRIP_BATCH]
-                await asyncio.gather(*(strip_one(str(row["user_id"])) for row in window))
+                await asyncio.gather(
+                    *(strip_one(str(row["user_id"])) for row in window),
+                    return_exceptions=True,
+                )
         self._schedule_role_delete(
             str(gw.guild_id), str(role.id), gw.id, delay=self.ROLE_DELETE_DELAY
         )
@@ -853,10 +884,14 @@ class GiveawayBot(commands.Bot):
         if not guild_id or not role_id or giveaway_id in self._scheduled_role_deletes:
             return
         self._scheduled_role_deletes.add(giveaway_id)
-        task = asyncio.get_running_loop().create_task(
-            self._delete_entrants_role_later(guild_id, role_id, giveaway_id, delay),
-            name=f"delete-role-{giveaway_id}",
-        )
+        try:
+            task = asyncio.get_running_loop().create_task(
+                self._delete_entrants_role_later(guild_id, role_id, giveaway_id, delay),
+                name=f"delete-role-{giveaway_id}",
+            )
+        except RuntimeError:
+            self._scheduled_role_deletes.discard(giveaway_id)
+            return
         self._role_tasks.add(task)
         task.add_done_callback(self._role_tasks.discard)
         # Also released from the callback, not only from the task's own finally:
@@ -1324,7 +1359,8 @@ class GiveawayBot(commands.Bot):
                 # B04: stale due rows must not beat a concurrent extend — the
                 # flip re-checks ends_at itself and refuses when extended.
                 ended, winners = await self._db_call(
-                    self.service.end, gw.id, require_due=True
+                    self.service.end, gw.id, require_due=True,
+                    _timeout=self.DB_LONG_TIMEOUT,
                 )
             except ServiceError as exc:
                 # Usually another ender won the claim (the tick and
@@ -1352,7 +1388,9 @@ class GiveawayBot(commands.Bot):
         # Restart recovery lives here too: deadlines are durable rows, so a
         # restart just picks up whatever is due on the next tick.
         try:
-            due_claims = await self._db_call(self.service.due_claims)
+            due_claims = await self._db_call(
+                self.service.due_claims, _timeout=self.DB_LONG_TIMEOUT
+            )
         except Exception:
             log.exception("due claims check failed")
             due_claims = []
@@ -1363,7 +1401,8 @@ class GiveawayBot(commands.Bot):
                 continue
             try:
                 ended_claim, fresh = await self._db_call(
-                    self.service.expire_claim, gid, uid
+                    self.service.expire_claim, gid, uid,
+                    _timeout=self.DB_LONG_TIMEOUT,
                 )
             except ServiceError as exc:
                 log.info("could not expire claim %s/%s: %s", gid, uid, exc.message)
@@ -1549,21 +1588,39 @@ class GiveawayBot(commands.Bot):
             parts.append("No valid entries — no winners this time.")
         content = "\n".join(parts) or None
         mentions = discord.AllowedMentions(everyone=False, users=True, roles=True)
-        try:
-            if gw.message_id and not reroll:
-                try:
-                    msg = await channel.fetch_message(int(gw.message_id))
-                    await msg.edit(embed=embed, view=claim_view)
-                except discord.HTTPException:
-                    pass
-                else:
-                    # An unsuccessful reply must not send a second winner embed.
-                    if content:
-                        await msg.reply(content, allowed_mentions=mentions)
-                    return
-            await channel.send(embed=embed, content=content, view=claim_view, allowed_mentions=mentions)
-        except discord.HTTPException:
-            log.warning("announce failed for %s", gw.id)
+        for attempt in range(3):
+            try:
+                if gw.message_id and not reroll:
+                    try:
+                        msg = await channel.fetch_message(int(gw.message_id))
+                        await msg.edit(embed=embed, view=claim_view)
+                    except discord.NotFound:
+                        pass
+                    except discord.HTTPException as exc:
+                        if attempt < 2 and exc.status in (500, 502, 503, 504, 429):
+                            await asyncio.sleep(0.5 * (attempt + 1))
+                            continue
+                    else:
+                        # An unsuccessful reply must not send a second winner embed.
+                        if content:
+                            for reply_attempt in range(2):
+                                try:
+                                    await msg.reply(content, allowed_mentions=mentions)
+                                    break
+                                except discord.HTTPException as exc:
+                                    if reply_attempt == 0 and exc.status in (500, 502, 503, 504, 429):
+                                        await asyncio.sleep(0.5)
+                                        continue
+                                    log.warning("announce reply failed for %s: %s", gw.id, exc)
+                        return
+                await channel.send(embed=embed, content=content, view=claim_view, allowed_mentions=mentions)
+                return
+            except discord.HTTPException as exc:
+                if attempt < 2 and exc.status in (500, 502, 503, 504, 429):
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                log.warning("announce failed for %s: %s", gw.id, exc)
+                break
 
 
 def wire_commands(bot: GiveawayBot) -> None:
@@ -1792,7 +1849,9 @@ def wire_commands(bot: GiveawayBot) -> None:
             gw = await bot._db_call(
                 svc.resolve, str(interaction.guild.id), giveaway_id
             )
-            ended, winners = await bot._db_call(svc.end, gw.id)
+            ended, winners = await bot._db_call(
+                svc.end, gw.id, _timeout=bot.DB_LONG_TIMEOUT
+            )
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
@@ -1827,10 +1886,13 @@ def wire_commands(bot: GiveawayBot) -> None:
             )
             if user is not None:
                 ended, fresh = await bot._db_call(
-                    svc.reroll, gw.id, 1, str(user.id)
+                    svc.reroll, gw.id, 1, str(user.id),
+                    _timeout=bot.DB_LONG_TIMEOUT,
                 )
             else:
-                ended, fresh = await bot._db_call(svc.reroll, gw.id, max(1, count))
+                ended, fresh = await bot._db_call(
+                    svc.reroll, gw.id, max(1, count), _timeout=bot.DB_LONG_TIMEOUT
+                )
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
@@ -2221,7 +2283,9 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         gid, uid = str(interaction.guild.id), str(user.id)
         try:
-            await bot._db_call(svc.blacklist_add, gid, uid)
+            await bot._db_call(
+                svc.blacklist_add, gid, uid, _timeout=bot.DB_LONG_TIMEOUT
+            )
             active = await bot._db_call(svc.list_active, gid)
         except Exception:
             log.exception("blacklist add failed for %s", uid)
@@ -2332,6 +2396,7 @@ def wire_commands(bot: GiveawayBot) -> None:
                 svc.blacklist_add, gid, uid,
                 hours=hours_int, reason=reason or "",
                 banned_by=str(getattr(interaction.user, "id", "")),
+                _timeout=bot.DB_LONG_TIMEOUT,
             )
             active = await bot._db_call(svc.list_active, gid)
         except ServiceError as exc:
@@ -2538,6 +2603,14 @@ def wire_commands(bot: GiveawayBot) -> None:
             except (discord.NotFound, discord.HTTPException):
                 pass
             return
+        if not _can_manage(interaction.user):
+            # Staff only, like every other command: the probe writes a temporary
+            # row to the database and spends cache operations.
+            try:
+                await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return
         t0 = time.perf_counter()
         try:
             # Reference only: one sleep(0) round-trip through the event loop.
@@ -2606,7 +2679,8 @@ def wire_commands(bot: GiveawayBot) -> None:
         preview = None
         if not live:
             try:
-                preview = svc.create(
+                preview = await bot._db_call(
+                    svc.create,
                     guild_id=gid,
                     channel_id=str(getattr(interaction, "channel_id", 0) or 0),
                     prize="Cache preview (deleted immediately)",
@@ -2798,7 +2872,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             # The preview exists only to give the cache legs a real key to read.
             # It must not outlive the probe that made it.
             try:
-                svc.discard(preview_id)
+                await bot._db_call(svc.discard, preview_id)
             except Exception:
                 log.exception("request-time preview cleanup failed")
         # Leg 2: one real SET + DEL on a probe-only Redis key, so the write
@@ -3161,6 +3235,10 @@ async def amain(settings: Settings) -> None:
             await redis.aclose()
         except Exception:
             log.debug("redis close failed", exc_info=True)
+        try:
+            db.close_all()
+        except Exception:
+            log.debug("database close failed", exc_info=True)
 
 
 def run_forever(settings: Settings) -> None:

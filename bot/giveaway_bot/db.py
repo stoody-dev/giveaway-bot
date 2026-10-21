@@ -121,11 +121,14 @@ SCHEMA_INDEXES = f"""
 CREATE INDEX IF NOT EXISTS idx_simple_gw_status_ends ON {TABLE_GIVEAWAYS}(status, ends_at);
 CREATE INDEX IF NOT EXISTS idx_simple_entries_giveaway ON {TABLE_ENTRIES}(giveaway_id);
 CREATE INDEX IF NOT EXISTS idx_simple_entries_user ON {TABLE_ENTRIES}(user_id);
+CREATE INDEX IF NOT EXISTS idx_simple_entries_giveaway_entered ON {TABLE_ENTRIES}(giveaway_id, entered_at);
 CREATE INDEX IF NOT EXISTS idx_simple_bl_cover ON simple_blacklist(guild_id, user_id, expires_at);
 CREATE INDEX IF NOT EXISTS idx_simple_bans_cover ON simple_giveaway_bans(guild_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_simple_banhits_cover
 ON simple_giveaway_ban_hits(guild_id, user_id, giveaway_id);
 CREATE INDEX IF NOT EXISTS idx_simple_msgcounts_pk ON simple_message_counts(guild_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_simple_claims_due ON simple_claims(status, deadline_ms);
+CREATE INDEX IF NOT EXISTS idx_simple_claims_gw ON simple_claims(giveaway_id, status);
 """
 
 

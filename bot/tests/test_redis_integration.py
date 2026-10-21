@@ -585,7 +585,7 @@ class RequestTimeProbeTests(CachedBotTestCase):
     def run_command(self):
         command = self.bot.tree.get_command("gw_request_time")
         self.assertIsNotNone(command, "the command must be registered")
-        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user(manage_guild=True))
         asyncio.run(command.callback(interaction))
         # FakeFollowup.send returns None, so the report lands as a follow-up.
         return interaction.followup.sent[-1]
@@ -798,7 +798,7 @@ def hanging_cache(delay: float = 30.0) -> RedisCache:
     """A Redis that accepts nothing: every call sleeps past the cache timeout."""
 
     class Hanging:
-        async def __getattr__(self, name):
+        def __getattr__(self, name):
             async def call(*args, **kwargs):
                 await asyncio.sleep(delay)
 
