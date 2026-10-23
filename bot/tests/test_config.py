@@ -117,6 +117,24 @@ class HelperAndClampTests(unittest.TestCase):
             self.assertEqual(get_settings().tick_seconds, 5)
         with patch.dict(os.environ, {"TICK_SECONDS": "45"}):
             self.assertEqual(get_settings().tick_seconds, 45)
+        with patch.dict(os.environ, {"TICK_SECONDS": "10000"}):
+            self.assertEqual(get_settings().tick_seconds, 3600)
+
+    def test_discord_token_fallback(self) -> None:
+        with patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "", "DISCORD_TOKEN": "token_from_fallback"}):
+            self.assertEqual(get_settings().bot_token, "token_from_fallback")
+        with patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "primary_token", "DISCORD_TOKEN": "fallback"}):
+            self.assertEqual(get_settings().bot_token, "primary_token")
+
+    def test_port_validation(self) -> None:
+        with patch.dict(os.environ, {"PORT": "8080"}):
+            self.assertEqual(get_settings().port, 8080)
+        with patch.dict(os.environ, {"PORT": "0"}):
+            self.assertEqual(get_settings().port, 0)
+        with patch.dict(os.environ, {"PORT": "-5"}):
+            self.assertEqual(get_settings().port, 10000)
+        with patch.dict(os.environ, {"PORT": "70000"}):
+            self.assertEqual(get_settings().port, 10000)
 
 
 if __name__ == "__main__":

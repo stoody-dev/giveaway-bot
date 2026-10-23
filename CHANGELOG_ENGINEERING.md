@@ -38,8 +38,18 @@ All notable technical changes, architectural hardening, bug fixes, and operation
 - **New Unit Tests**:
   - `bot/tests/test_health.py`: 5 tests covering HTTP health, readiness, and status page behavior.
   - `bot/tests/test_cli.py`: 5 tests covering `doctor`, `run`, and `--version` CLI commands.
-  - `bot/tests/test_config.py`: Extended test suite with `_bool`, `_int`, and `tick_seconds` clamping tests.
-- **Clean Linter Status**: Passed `ruff check bot` with zero warnings or errors.
+  - `bot/tests/test_config.py`: Extended test suite with `_bool`, `_int`, and `tick_seconds` clamping tests, plus token fallback and port validation.
+  - `bot/tests/test_app.py`: 3 tests covering repository-root `app.py` argument forwarding, default run execution, and missing package handling.
+- **Clean Linter Status**: Passed `ruff check bot app.py` with zero warnings or errors.
+- **Overall Suite**: Expanded from 359 to 377 automated tests, 100% passing.
+
+#### F. Additional Robustness & Performance Enhancements
+- **Multi-Environment Token Discovery**: `DISCORD_TOKEN` supported alongside `DISCORD_BOT_TOKEN`, avoiding configuration friction on platforms that standardize on `DISCORD_TOKEN`.
+- **Port and Interval Guarding**: Clamped `PORT` to valid TCP port range (`0 <= port <= 65535`) and bounded `TICK_SECONDS` to `5..3600`, preventing malformed environment values from crashing socket binds or stalling scheduling loops.
+- **Guaranteed Cleanup in Diagnostics**: Wrapped preview giveaway rows in `gw_request_time` in a `try ... finally` block, ensuring probe data is discarded even on early probe errors or network cancellations.
+- **Proactive Command Cache Flushing**: Added `bot._spawn_bg(bot._flush_invalidation())` to manual administrative actions (`giveaway_end`, `giveaway_cancel`, `giveaway_reroll`, `giveaway_extend`) so Redis cache keys invalidate immediately without waiting out TTLs.
+- **Concurrent Active Giveaway Counting**: Refactored `/giveaway_list` to fetch up to 10 active giveaway entry counts concurrently using `asyncio.gather`, cutting multi-giveaway list latency.
+- **Dependency & CI Harmonization**: Added `redis` optional dependency to `pyproject.toml` and aligned GitHub Actions workflow to Python 3.13 (matching `Dockerfile` and `sillydev.conf`).
 
 ---
 

@@ -1770,17 +1770,11 @@ def wire_commands(bot: GiveawayBot) -> None:
                 claim_timeout_seconds=max(0, claim_minutes) * 60,
             )
         except ServiceError as exc:
-            try:
-                await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
-            except (discord.NotFound, discord.HTTPException):
-                pass
+            await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
         except Exception:
             log.exception("create failed")
-            try:
-                await interaction.followup.send("⚠️ Could not create. Try again.", ephemeral=True)
-            except (discord.NotFound, discord.HTTPException):
-                pass
+            await bot._safe_followup(interaction, "⚠️ Could not create. Try again.")
             return
         # Ping everyone who should know: the server notify role (one-time
         # setup) plus each required role (the people allowed to join).
@@ -1797,17 +1791,20 @@ def wire_commands(bot: GiveawayBot) -> None:
                 view=GiveawayView(gw.id, bot.settings.dashboard_url),
                 allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True),
             )
-        except (discord.Forbidden, discord.HTTPException) as exc:
+        except Exception as exc:
             # The row already exists. Leaving it would run a giveaway nobody can
             # see and then auto-draw winners into a channel that already refused
             # the bot, so the record is dropped and the reason reported.
             log.warning("cannot post giveaway %s in %s: %s", gw.id, channel.id, exc)
             await bot._db_call(svc.discard, gw.id)
-            await bot._safe_followup(
-                interaction,
-                f"⚠️ I cannot post in {channel.mention}. Give me **Send Messages**"
-                " there (or set the DISCORD_GIVEAWAY_CHANNEL_ID env var) and try again.",
-            )
+            if isinstance(exc, discord.Forbidden):
+                msg_reason = (
+                    f"I cannot post in {channel.mention}. Give me **Send Messages**"
+                    " there (or set the DISCORD_GIVEAWAY_CHANNEL_ID env var) and try again."
+                )
+            else:
+                msg_reason = f"Could not post in {channel.mention}: {exc}"
+            await bot._safe_followup(interaction, f"⚠️ {msg_reason}")
             return
         message_note = ""
         try:
@@ -1856,6 +1853,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
         bot._gw_drop(gw.id)
+        bot._spawn_bg(bot._flush_invalidation())
         await bot._announce(ended, winners)
         await bot._strip_entrants_role(ended)
         await bot._safe_followup(interaction, f"Ended with {len(winners)} winner(s).")
@@ -1896,6 +1894,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
+        bot._spawn_bg(bot._flush_invalidation())
         await bot._announce(ended, fresh, reroll=True)
         if user is not None and fresh:
             await bot._safe_followup(
@@ -1955,6 +1954,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
         bot._gw_drop(gw.id)
+        bot._spawn_bg(bot._flush_invalidation())
         # Answer before the cleanup. Stripping entrants one by one can take much
         # longer than the 3 seconds Discord allows for the first response, and
         # the old order made a successful cancel look like a broken command.
@@ -2014,6 +2014,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
         bot._gw_drop(gw.id)
+        bot._spawn_bg(bot._flush_invalidation())
         await bot._refresh_embed(fresh)
         await bot._safe_followup(
             interaction,
@@ -2116,9 +2117,14 @@ def wire_commands(bot: GiveawayBot) -> None:
         if not active:
             await bot._safe_followup(interaction, "No active giveaways.")
             return
+        top_active = active[:10]
+        counts = await asyncio.gather(
+            *(bot._db_call(svc.entry_count, gw.id) for gw in top_active),
+            return_exceptions=True,
+        )
         lines = []
-        for gw in active[:10]:
-            n = await bot._db_call(svc.entry_count, gw.id)
+        for gw, count_res in zip(top_active, counts, strict=False):
+            n = count_res if isinstance(count_res, int) else 0
             each = f" — **{min(100.0, gw.winner_count / n * 100):.1f}%** each" if n else ""
             # Ten lines carrying full 256-character prizes pass Discord's 2000
             # character cap, and the resulting 400 would be swallowed by
@@ -2693,188 +2699,190 @@ def wire_commands(bot: GiveawayBot) -> None:
                 preview = None
         preview_id = preview.id if preview is not None else ""
         gw_id = live[0].id if live else ""
-        # Leg 1: the real Redis path this request takes, in the order it takes
-        # it — one PING through the governed shared client, then the two cached
-        # readers on their real keys. Both readers are read-through, so each run
-        # reports HIT or MISS with the cost that actually came with it; nothing
-        # here is simulated. The pair is run twice on purpose: the second run is
-        # the warm cost a click pays, and the first shows what filling an empty
-        # cache costs. A report that printed only the warm run would look fast
-        # while saying nothing.
-        redis = getattr(bot, "redis", None)
-        if redis is None or not getattr(redis, "configured", False):
-            redis_note = "not configured (no REDIS_URL) — every read here falls through to the database"
-        else:
-
-            async def _timed_cached(reader, *args):
-                """One cached reader call: (ms, value, served).
-
-                'served' is read off the cache's own hit counter, never guessed,
-                so the report can say HIT or MISS with the cost that came with
-                it. A warm read and a fall-through to the database are very
-                different numbers and must never be blurred into one.
-                """
-                try:
-                    c0 = int((redis.stats().get("counters") or {}).get("hits", 0))
-                except Exception:
-                    c0 = None
-                started = time.perf_counter()
-                try:
-                    value = await reader(*args)
-                except Exception:
-                    return None, None, None
-                elapsed = (time.perf_counter() - started) * 1000.0
-                served = None
-                try:
-                    c1 = int((redis.stats().get("counters") or {}).get("hits", 0))
-                    if c0 is not None:
-                        served = c1 > c0
-                except Exception:
-                    served = None
-                return elapsed, value, served
-
-            def _label(served: bool | None) -> str:
-                if served is None:
-                    return "hit/miss unknown"
-                return "HIT" if served else "MISS (fell through to the database)"
-
-            def _runs_note(runs: list[tuple[float | None, str, bool | None]]) -> str:
-                if len(runs) == 2 and runs[0][1] == runs[1][1]:
-                    # Both runs took the same path: one phrase says it better
-                    # than "1st X; 2nd X", which reads like a stutter.
-                    label = runs[1][1]
-                    if runs[1][0] is None:
-                        return f"both runs {label}"
-                    return (
-                        f"both runs {label}, 1st {runs[0][0]:.0f}ms"
-                        f" -> 2nd {runs[1][0]:.0f}ms"
-                    )
-                parts = []
-                for index, (ms, label, _served) in enumerate(runs, 1):
-                    shown = "" if label == "failed" else f" {f'{ms:.0f}ms' if ms is not None else 'n/a'}"
-                    parts.append(f"{'1st' if index == 1 else '2nd'}{shown} {label}")
-                return "; ".join(parts)
-
-            try:
-                before = dict(redis.stats().get("counters") or {})
-            except Exception:
-                before = {}
-            # Leg 1a: the active-giveaway list a click reads. No micro-TTL here
-            # — it is the key create/end/discard invalidate — so it is the
-            # cheapest honest read to show beside the count. Read BEFORE the
-            # PING so the HIT/MISS is the state a click would have found, not
-            # one this probe just warmed.
-            try:
-                t_leg = time.perf_counter()
-                list_cached = await svc.list_active_cached(gid)
-                list_ms = (time.perf_counter() - t_leg) * 1000.0
-                try:
-                    served_now = int((redis.stats().get("counters") or {}).get("hits", 0))
-                    if served_now > int(before.get("hits", 0) or 0):
-                        list_note = (
-                            f"HIT - {len(list_cached)} active giveaway(s), from the cache"
-                        )
-                    else:
-                        list_note = (
-                            f"MISS (read the database) - {len(list_cached)}"
-                            " active giveaway(s)"
-                        )
-                except Exception:
-                    list_note = f"{len(list_cached)} active giveaway(s)"
-            except Exception:
-                log.exception("request-time cached list probe failed")
-                list_note = "cached list probe failed"
-            try:
-                t_leg = time.perf_counter()
-                redis_ms = await redis.ping_ms()
-                redis_note = "PING through the shared client (auth + pool reuse included)"
-            except Exception:
-                log.exception("request-time redis ping failed")
-                redis_note = "redis ping failed"
-            # The cached readers live on the service; it only has them when a
-            # cache is wired in. Reading through svc is what a real click does.
-            gwc = bot.service if getattr(bot.service, "_redis", None) is not None else None
-            if gwc is None:
-                count_note = role_note = "no cache wired into the service"
-            elif not (gw_id or preview_id):
-                count_note = "no live giveaway, and the preview row could not be created"
+        try:
+            # Leg 1: the real Redis path this request takes, in the order it takes
+            # it — one PING through the governed shared client, then the two cached
+            # readers on their real keys. Both readers are read-through, so each run
+            # reports HIT or MISS with the cost that actually came with it; nothing
+            # here is simulated. The pair is run twice on purpose: the second run is
+            # the warm cost a click pays, and the first shows what filling an empty
+            # cache costs. A report that printed only the warm run would look fast
+            # while saying nothing.
+            redis = getattr(bot, "redis", None)
+            if redis is None or not getattr(redis, "configured", False):
+                redis_note = "not configured (no REDIS_URL) — every read here falls through to the database"
             else:
-                # Twice on purpose: run 1 is what a cold cache costs (it falls
-                # through to the database), run 2 is the warm cost a click pays. Both
-                # numbers are printed; a report showing only the warm run would
-                # look fast while saying nothing.
-                count_runs: list[tuple[float | None, str, bool | None]] = []
-                role_runs: list[tuple[float | None, str, bool | None]] = []
-                n_cached = None
-                probe_id = gw_id or preview_id
-                for _ in range(2):
-                    ms, n_cached, served = await _timed_cached(
-                        gwc.entry_count_cached, probe_id
-                    )
-                    count_runs.append((ms, "failed" if ms is None else _label(served), served))
-                    ms, _role, served = await _timed_cached(
-                        gwc.get_notify_role_cached, gid
-                    )
-                    role_runs.append((ms, "failed" if ms is None else _label(served), served))
-                # The headline number is the warm run (what a repeat click
-                # pays); both runs stay visible in the note beside it.
-                warm_count_ms = count_runs[-1][0]
-                warm_role_ms = role_runs[-1][0]
-                count_ms = warm_count_ms
-                role_ms = warm_role_ms
-                # "Served from the cache" is a claim, not a label: it may only
-                # be printed when BOTH runs of the pair were answered without a
-                # fall-through. If either read the database, the warm number is
-                # the cost of a read that missed, and calling that the repeat
-                # click's cache cost would flatter the report.
-                warm_pair = count_runs[-1][2] is True and role_runs[-1][2] is True
-                cold_vals = [
-                    runs[0][0] for runs in (count_runs, role_runs) if runs[0][0] is not None
-                ]
-                if len(cold_vals) == 2:
-                    cold_total_ms = sum(cold_vals)
-                warm_vals = [v for v in (warm_count_ms, warm_role_ms) if v is not None]
-                if len(warm_vals) == 2:
-                    warm_total_ms = sum(warm_vals)
-                count_note = f"{_runs_note(count_runs)} - {n_cached} entrant(s)"
-                role_note = _runs_note(role_runs)
-                if not gw_id:
-                    # Say plainly that the per-giveaway key was measured on a
-                    # throwaway row, so nobody reads it as a live giveaway.
-                    note = "(no live giveaway — measured on a preview row this probe deleted)"
-                    count_note = f"{count_note} {note}"
-                    role_note = f"{role_note} {note}"
-            try:
-                after = dict(redis.stats().get("counters") or {})
-            except Exception:
-                after = {}
-            deltas: dict[str, int] = {}
-            for name in ("hits", "misses", "skipped", "failed", "attempted", "ok"):
-                try:
-                    deltas[name] = int(after.get(name, 0)) - int(before.get(name, 0))
-                except Exception:
-                    pass
-            redis_hits = deltas.get("hits")
-            redis_misses = deltas.get("misses")
-            redis_skipped = deltas.get("skipped")
-            redis_failed = deltas.get("failed")
-            cache_ops = deltas.get("attempted")
-            cache_stores = deltas.get("ok")
-            cache_gets = (
-                redis_hits + redis_misses
-                if None not in (redis_hits, redis_misses)
-                else None
-            )
 
-            if before and not after:
-                count_note = role_note = "cache stats unavailable"
-        if preview_id:
-            # The preview exists only to give the cache legs a real key to read.
-            # It must not outlive the probe that made it.
-            try:
-                await bot._db_call(svc.discard, preview_id)
-            except Exception:
-                log.exception("request-time preview cleanup failed")
+                async def _timed_cached(reader, *args):
+                    """One cached reader call: (ms, value, served).
+
+                    'served' is read off the cache's own hit counter, never guessed,
+                    so the report can say HIT or MISS with the cost that came with
+                    it. A warm read and a fall-through to the database are very
+                    different numbers and must never be blurred into one.
+                    """
+                    try:
+                        c0 = int((redis.stats().get("counters") or {}).get("hits", 0))
+                    except Exception:
+                        c0 = None
+                    started = time.perf_counter()
+                    try:
+                        value = await reader(*args)
+                    except Exception:
+                        return None, None, None
+                    elapsed = (time.perf_counter() - started) * 1000.0
+                    served = None
+                    try:
+                        c1 = int((redis.stats().get("counters") or {}).get("hits", 0))
+                        if c0 is not None:
+                            served = c1 > c0
+                    except Exception:
+                        served = None
+                    return elapsed, value, served
+
+                def _label(served: bool | None) -> str:
+                    if served is None:
+                        return "hit/miss unknown"
+                    return "HIT" if served else "MISS (fell through to the database)"
+
+                def _runs_note(runs: list[tuple[float | None, str, bool | None]]) -> str:
+                    if len(runs) == 2 and runs[0][1] == runs[1][1]:
+                        # Both runs took the same path: one phrase says it better
+                        # than "1st X; 2nd X", which reads like a stutter.
+                        label = runs[1][1]
+                        if runs[1][0] is None:
+                            return f"both runs {label}"
+                        return (
+                            f"both runs {label}, 1st {runs[0][0]:.0f}ms"
+                            f" -> 2nd {runs[1][0]:.0f}ms"
+                        )
+                    parts = []
+                    for index, (ms, label, _served) in enumerate(runs, 1):
+                        shown = "" if label == "failed" else f" {f'{ms:.0f}ms' if ms is not None else 'n/a'}"
+                        parts.append(f"{'1st' if index == 1 else '2nd'}{shown} {label}")
+                    return "; ".join(parts)
+
+                try:
+                    before = dict(redis.stats().get("counters") or {})
+                except Exception:
+                    before = {}
+                # Leg 1a: the active-giveaway list a click reads. No micro-TTL here
+                # — it is the key create/end/discard invalidate — so it is the
+                # cheapest honest read to show beside the count. Read BEFORE the
+                # PING so the HIT/MISS is the state a click would have found, not
+                # one this probe just warmed.
+                try:
+                    t_leg = time.perf_counter()
+                    list_cached = await svc.list_active_cached(gid)
+                    list_ms = (time.perf_counter() - t_leg) * 1000.0
+                    try:
+                        served_now = int((redis.stats().get("counters") or {}).get("hits", 0))
+                        if served_now > int(before.get("hits", 0) or 0):
+                            list_note = (
+                                f"HIT - {len(list_cached)} active giveaway(s), from the cache"
+                            )
+                        else:
+                            list_note = (
+                                f"MISS (read the database) - {len(list_cached)}"
+                                " active giveaway(s)"
+                            )
+                    except Exception:
+                        list_note = f"{len(list_cached)} active giveaway(s)"
+                except Exception:
+                    log.exception("request-time cached list probe failed")
+                    list_note = "cached list probe failed"
+                try:
+                    t_leg = time.perf_counter()
+                    redis_ms = await redis.ping_ms()
+                    redis_note = "PING through the shared client (auth + pool reuse included)"
+                except Exception:
+                    log.exception("request-time redis ping failed")
+                    redis_note = "redis ping failed"
+                # The cached readers live on the service; it only has them when a
+                # cache is wired in. Reading through svc is what a real click does.
+                gwc = bot.service if getattr(bot.service, "_redis", None) is not None else None
+                if gwc is None:
+                    count_note = role_note = "no cache wired into the service"
+                elif not (gw_id or preview_id):
+                    count_note = "no live giveaway, and the preview row could not be created"
+                else:
+                    # Twice on purpose: run 1 is what a cold cache costs (it falls
+                    # through to the database), run 2 is the warm cost a click pays. Both
+                    # numbers are printed; a report showing only the warm run would
+                    # look fast while saying nothing.
+                    count_runs: list[tuple[float | None, str, bool | None]] = []
+                    role_runs: list[tuple[float | None, str, bool | None]] = []
+                    n_cached = None
+                    probe_id = gw_id or preview_id
+                    for _ in range(2):
+                        ms, n_cached, served = await _timed_cached(
+                            gwc.entry_count_cached, probe_id
+                        )
+                        count_runs.append((ms, "failed" if ms is None else _label(served), served))
+                        ms, _role, served = await _timed_cached(
+                            gwc.get_notify_role_cached, gid
+                        )
+                        role_runs.append((ms, "failed" if ms is None else _label(served), served))
+                    # The headline number is the warm run (what a repeat click
+                    # pays); both runs stay visible in the note beside it.
+                    warm_count_ms = count_runs[-1][0]
+                    warm_role_ms = role_runs[-1][0]
+                    count_ms = warm_count_ms
+                    role_ms = warm_role_ms
+                    # "Served from the cache" is a claim, not a label: it may only
+                    # be printed when BOTH runs of the pair were answered without a
+                    # fall-through. If either read the database, the warm number is
+                    # the cost of a read that missed, and calling that the repeat
+                    # click's cache cost would flatter the report.
+                    warm_pair = count_runs[-1][2] is True and role_runs[-1][2] is True
+                    cold_vals = [
+                        runs[0][0] for runs in (count_runs, role_runs) if runs[0][0] is not None
+                    ]
+                    if len(cold_vals) == 2:
+                        cold_total_ms = sum(cold_vals)
+                    warm_vals = [v for v in (warm_count_ms, warm_role_ms) if v is not None]
+                    if len(warm_vals) == 2:
+                        warm_total_ms = sum(warm_vals)
+                    count_note = f"{_runs_note(count_runs)} - {n_cached} entrant(s)"
+                    role_note = _runs_note(role_runs)
+                    if not gw_id:
+                        # Say plainly that the per-giveaway key was measured on a
+                        # throwaway row, so nobody reads it as a live giveaway.
+                        note = "(no live giveaway — measured on a preview row this probe deleted)"
+                        count_note = f"{count_note} {note}"
+                        role_note = f"{role_note} {note}"
+                try:
+                    after = dict(redis.stats().get("counters") or {})
+                except Exception:
+                    after = {}
+                deltas: dict[str, int] = {}
+                for name in ("hits", "misses", "skipped", "failed", "attempted", "ok"):
+                    try:
+                        deltas[name] = int(after.get(name, 0)) - int(before.get(name, 0))
+                    except Exception:
+                        pass
+                redis_hits = deltas.get("hits")
+                redis_misses = deltas.get("misses")
+                redis_skipped = deltas.get("skipped")
+                redis_failed = deltas.get("failed")
+                cache_ops = deltas.get("attempted")
+                cache_stores = deltas.get("ok")
+                cache_gets = (
+                    redis_hits + redis_misses
+                    if None not in (redis_hits, redis_misses)
+                    else None
+                )
+
+                if before and not after:
+                    count_note = role_note = "cache stats unavailable"
+        finally:
+            if preview_id:
+                # The preview exists only to give the cache legs a real key to read.
+                # It must not outlive the probe that made it.
+                try:
+                    await bot._db_call(svc.discard, preview_id)
+                except Exception:
+                    log.exception("request-time preview cleanup failed")
         # Leg 2: one real SET + DEL on a probe-only Redis key, so the write
         # path is measured and not just the reads. The key is namespaced and
         # deleted again on every path, including the failure path below.

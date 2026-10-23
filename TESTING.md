@@ -47,7 +47,7 @@ pip install -r requirements.txt
 The test suite uses standard-library `unittest` with an in-memory SQLite backend that executes the exact SQL queries, indexes, migrations, and constraints used in production. **No Turso account, network access, or Discord tokens are required to run the automated tests.**
 
 ### 3.1 Full Test Suite Run
-Run all 372 automated tests with strict warning checking:
+Run all 377 automated tests with strict warning checking:
 
 **Windows (PowerShell)**:
 ```powershell
@@ -81,6 +81,9 @@ Run all 372 automated tests with strict warning checking:
 
 # CLI subcommands (doctor, run, --version)
 & .\.venv\Scripts\python.exe -m unittest discover -s bot/tests -p "test_cli.py" -t bot
+
+# Repository root entrypoint (app.py)
+& .\.venv\Scripts\python.exe -m unittest discover -s bot/tests -p "test_app.py" -t bot
 
 # Embed generation and countdown formatting
 & .\.venv\Scripts\python.exe -m unittest discover -s bot/tests -p "test_embeds.py" -t bot

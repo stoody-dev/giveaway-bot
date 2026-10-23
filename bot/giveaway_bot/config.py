@@ -64,7 +64,11 @@ def _color(name: str, default: int) -> int:
 
 @dataclass
 class Settings:
-    bot_token: str = field(default_factory=lambda: os.getenv("DISCORD_BOT_TOKEN", "").strip())
+    bot_token: str = field(
+        default_factory=lambda: (
+            os.getenv("DISCORD_BOT_TOKEN", "") or os.getenv("DISCORD_TOKEN", "")
+        ).strip()
+    )
     giveaway_channel_id: str = field(
         default_factory=lambda: (
             os.getenv("DISCORD_GIVEAWAY_CHANNEL_ID", "") or os.getenv("GIVEAWAY_CHANNEL_ID", "")
@@ -107,4 +111,8 @@ def get_settings() -> Settings:
     settings.embed_color = _color("EMBED_COLOR", settings.embed_color)
     if settings.tick_seconds < 5:
         settings.tick_seconds = 5
+    elif settings.tick_seconds > 3600:
+        settings.tick_seconds = 3600
+    if not (0 <= settings.port <= 65535):
+        settings.port = 10000
     return settings
