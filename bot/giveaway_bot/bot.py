@@ -18,6 +18,8 @@ from discord.ext import commands, tasks
 from . import embeds
 from .config import Settings
 from .db import Database
+from .logs import configure_logging
+from .metrics import render as render_metrics
 from .redis_cache import RedisCache
 from .service import TIMEOUT_BAN_KIND, Giveaway, GiveawayService, PartialFlush, ServiceError
 from .views import ClaimView, GiveawayView, ParticipantsPages
@@ -82,10 +84,16 @@ def _still_in_guild(guild: discord.Guild, user_id: str) -> bool:
 
 
 class GiveawayBot(commands.Bot):
-    def __init__(self, settings: Settings, db: Database, redis=None) -> None:
+    def __init__(
+        self, settings: Settings, db: Database, redis=None, ready_state: dict | None = None
+    ) -> None:
         super().__init__(command_prefix="!", intents=build_intents(), help_command=None)
         self.settings = settings
         self.db = db
+        #: The mutable status the health server's /ready and / pages read. The
+        #: gateway is only really up once on_ready fires, so that is the one
+        #: place that marks it online (amain used to do it before login).
+        self.ready_state = ready_state
         #: Shared short-TTL read cache + concurrency damper. Built once in
         #: amain() next to db (so it survives login retries) and passed in;
         #: None (or an unconfigured cache) means every read goes to Turso
@@ -348,6 +356,9 @@ class GiveawayBot(commands.Bot):
         self.flush_messages.start()
 
     async def on_ready(self) -> None:
+        if self.ready_state is not None:
+            self.ready_state["status"] = "online"
+            self.ready_state["discord"] = "online"
         log.info("logged in as %s (%d guilds)", self.user, len(self.guilds))
         # Duplicate-command cleanup (one-shot per process): aa22c23 mirrored
         # the global tree into every guild for instant visibility, but that
@@ -3134,7 +3145,11 @@ def _login_exc_summary(exc: BaseException) -> str:
 
 
 async def amain(settings: Settings) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    configure_logging(
+        getattr(settings, "log_format", "text"),
+        getattr(settings, "log_level", "INFO"),
+        secrets=(settings.bot_token, settings.turso_token, getattr(settings, "redis_url", "")),
+    )
     if not settings.bot_token:
         raise SystemExit("DISCORD_BOT_TOKEN is not set.")
     from .health import start_health_server
@@ -3144,8 +3159,35 @@ async def amain(settings: Settings) -> None:
     # plain dict keeps the health thread (no asyncio there) race-free enough
     # for a status string.
     ready_state: dict[str, str] = {"status": "starting"}
-    start_health_server(max(1, settings.port), ready_state=ready_state)
+    current: dict[str, object] = {"bot": None}
+    started = time.monotonic()
+    # The health port must be bound before anything slow or fallible, so the
+    # database and cache are bound below and the metrics closure reaches them
+    # through this holder; a scrape before they exist just reports zeros.
+    shared: dict[str, object] = {"db": None, "redis": None}
+
+    def metrics_page() -> str:
+        bot_obj = current.get("bot")
+        cache = shared.get("redis")
+        database = shared.get("db")
+        service = getattr(bot_obj, "service", None)
+        return render_metrics(
+            discord_state=str(ready_state.get("discord", "starting")),
+            uptime_seconds=time.monotonic() - started,
+            db_stats=database.get_stats() if database is not None else {},
+            redis_stats=cache.stats() if cache is not None else None,
+            guilds=len(getattr(bot_obj, "guilds", None) or []),
+            pending_invalidations=service.pending_invalidation_count() if service else 0,
+        )
+
+    metrics_kwargs = (
+        {"metrics_token": settings.metrics_token, "metrics_provider": metrics_page}
+        if getattr(settings, "metrics_token", "")
+        else {}
+    )
+    start_health_server(max(1, settings.port), ready_state=ready_state, **metrics_kwargs)
     db = Database(settings)
+    shared["db"] = db
     db.init_schema()
     # Redis is a short-TTL read cache plus a concurrency damper, never a
     # source of truth: every entry is still confirmed by a Turso commit
@@ -3156,6 +3198,7 @@ async def amain(settings: Settings) -> None:
         getattr(settings, "redis_url", ""),
         enabled=bool(getattr(settings, "redis_enabled", True)),
     )
+    shared["redis"] = redis
     try:
         if await redis.start():
             log.info("redis cache ready (%s)", redis.describe())
@@ -3168,7 +3211,6 @@ async def amain(settings: Settings) -> None:
         log.warning("redis start failed; continuing without the cache", exc_info=True)
     loop = asyncio.get_running_loop()
     shutdown_task: asyncio.Task | None = None
-    current: dict[str, object] = {"bot": None}
 
     def shutdown() -> None:
         nonlocal shutdown_task
@@ -3194,13 +3236,12 @@ async def amain(settings: Settings) -> None:
             # instance closed. Re-entering it misreads as a deliberate stop
             # (is_closed() True) and re-starting a closed client is unreliable,
             # so never reuse an instance that just failed to log in.
-            bot = GiveawayBot(settings, db, redis)
+            bot = GiveawayBot(settings, db, redis, ready_state=ready_state)
             wire_commands(bot)
             current["bot"] = bot
             try:
                 async with bot:
-                    ready_state["status"] = "online"
-                    ready_state["discord"] = "online"
+                    # "online" is set by on_ready, once the gateway is really up.
                     await bot.start(settings.bot_token)
                 if shutdown_task is not None:
                     await shutdown_task

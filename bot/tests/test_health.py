@@ -108,5 +108,60 @@ class HealthServerTests(unittest.TestCase):
         self.assertEqual(body, b"")
 
 
+class MetricsRouteTests(unittest.TestCase):
+    TOKEN = "scrape-token-1234"  # noqa: S105 - test fixture, not a credential
+
+    def _serve(self, token: str, provider) -> int:
+        server = start_health_server(
+            0, ready_state={"status": "online", "discord": "online"},
+            metrics_token=token, metrics_provider=provider,
+        )
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def _call(self, port: int, path: str, auth: str | None = None, method: str = "GET"):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)  # noqa: S310
+        if auth is not None:
+            req.add_header("Authorization", auth)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+                return resp.status, resp.read().decode(), resp.headers
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode(), exc.headers
+
+    def test_route_does_not_exist_without_a_token(self) -> None:
+        port = self._serve("", lambda: "giveaway_bot_up 1\n")
+        status, body, _ = self._call(port, "/metrics", f"Bearer {self.TOKEN}")
+        self.assertEqual((status, body), (404, "not found"))
+
+    def test_missing_or_wrong_token_is_unauthorized(self) -> None:
+        port = self._serve(self.TOKEN, lambda: "giveaway_bot_up 1\n")
+        for auth in (None, "Bearer wrong", self.TOKEN, "Basic abc"):
+            status, body, _ = self._call(port, "/metrics", auth)
+            self.assertEqual(status, 401, auth)
+            self.assertNotIn("giveaway_bot_up", body)
+
+    def test_right_token_serves_the_provider_page(self) -> None:
+        port = self._serve(self.TOKEN, lambda: "giveaway_bot_up 1\n")
+        status, body, headers = self._call(port, "/metrics?x=1", f"Bearer {self.TOKEN}")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, "giveaway_bot_up 1\n")
+        self.assertTrue(headers["Content-Type"].startswith("text/plain; version=0.0.4"))
+        code, empty, _ = self._call(port, "/metrics", f"Bearer {self.TOKEN}", method="HEAD")
+        self.assertEqual((code, empty), (200, ""))
+
+    def test_provider_failure_only_breaks_metrics(self) -> None:
+        def boom() -> str:
+            raise RuntimeError("stats exploded")
+
+        port = self._serve(self.TOKEN, boom)
+        status, body, _ = self._call(port, "/metrics", f"Bearer {self.TOKEN}")
+        self.assertEqual(status, 500)
+        self.assertNotIn("exploded", body)
+        self.assertEqual(self._call(port, "/health")[0], 200)
+        self.assertEqual(self._call(port, "/ready")[0], 200)
+
+
 if __name__ == "__main__":
     unittest.main()

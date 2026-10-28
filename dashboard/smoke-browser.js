@@ -60,6 +60,7 @@ try {
   let pauseNextList = false;
   let releaseList;
   let failNextDelete = false;
+  let sessionToken = "tok-123";
   const items = Array.from({ length: 50 }, (_, n) => ({
     id: "gw_" + (n + 1), prize: "Prize " + (n + 1), status: "ended", entrants: { count: 0 },
     timer: { ended_at: Date.now() - 1000 },
@@ -88,6 +89,16 @@ try {
   globalThis.fetch = async (_url, init) => {
     const body = JSON.parse(init.body);
     const respond = (status, data) => ({ ok: status < 400, status, json: async () => data });
+    if (body.action === "login") {
+      return body.password === "preview-test-only"
+        ? respond(200, { token: "tok-123", expires_at: Date.now() + 1000 })
+        : respond(401, { error: "Wrong password" });
+    }
+    // Everything else needs the token, never the password.
+    assert.equal("password" in body, false, "the password is only sent to log in");
+    if (init.headers.Authorization !== `Bearer ${sessionToken}`) {
+      return respond(401, { error: "Session expired. Log in again." });
+    }
     if (body.action === "ping") return respond(200, { ok: true });
     if (body.action === "list") {
       listCalls++;
@@ -116,6 +127,7 @@ try {
   await import("./public/admin.js?smoke-admin");
   get("pw").value = "preview-test-only";
   await get("login").listeners.submit({ preventDefault() {} });
+  assert.equal(store.get("gw_admin"), "tok-123", "the session token, not the password, is stored");
   assert.equal(get("page-count").textContent, "1–50 of 51");
   delButton.dataset.del = "gw_last";
   get("next-page").listeners.click();
@@ -145,6 +157,16 @@ try {
   await flush();
   assert.equal(listCalls, beforeQueue + 2, "queued rerun loads after busy request");
   console.log("admin pager, queued refresh, failed delete, and toast ok");
+
+  // An expired session drops back to the login form and forgets the token.
+  sessionToken = "something-else";
+  get("login-view").hidden = true;
+  get("refresh").listeners.click();
+  await flush();
+  assert.equal(store.has("gw_admin"), false, "a 401 clears the stored token");
+  assert.equal(get("login-view").hidden, false, "a 401 shows the login form");
+  assert.equal(get("login-err").textContent, "Session expired. Log in again.");
+  console.log("admin expired session ok");
 } finally {
   restore();
 }

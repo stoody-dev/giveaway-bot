@@ -1,5 +1,8 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { card, db, placeholders, send } from "./_lib/turso.js";
+import {
+  SESSION_TTL_MS, bearerToken, lockedFor, recordFailure, recordSuccess, signToken, verifyToken,
+} from "./_lib/adminAuth.js";
 
 
 /** Rows per page cap — the panel pages through everything else. */
@@ -110,6 +113,38 @@ async function deleteMany(ids) {
   return results;
 }
 
+const tooMany = (res, waitMs) => {
+  res.setHeader("Retry-After", String(Math.max(1, Math.ceil(waitMs / 1000))));
+  return send(res, 429, { error: "Too many failed attempts. Try again later." }, "no-store");
+};
+
+/**
+ * The only place the password is accepted. A good one is answered with a
+ * signed session token; every other action needs that token instead. Failed
+ * attempts are counted per client in Turso, so the lockout holds across
+ * serverless instances. If the counter cannot be read or written, login fails
+ * closed rather than running unlimited.
+ */
+async function login(req, res, body, password) {
+  const now = Date.now();
+  try {
+    const wait = await lockedFor(req, now);
+    if (wait > 0) return tooMany(res, wait);
+
+    if (!authorized(body?.password, password)) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const locked = await recordFailure(req, now);
+      if (locked > 0) return tooMany(res, locked);
+      return send(res, 401, { error: "Wrong password" }, "no-store");
+    }
+    await recordSuccess(req);
+  } catch (err) {
+    console.error("Admin login limiter error:", err);
+    return send(res, 503, { error: "Login temporarily unavailable" }, "no-store");
+  }
+  return send(res, 200, { token: signToken(now), expires_at: now + SESSION_TTL_MS }, "no-store");
+}
+
 export default async function handler(req, res) {
   const password = process.env.ADMIN_PASSWORD;
   if (!password) return send(res, 503, { error: "Admin disabled: ADMIN_PASSWORD not set" }, "no-store");
@@ -124,13 +159,12 @@ export default async function handler(req, res) {
       body = {};
     }
   }
-  const pw = req.headers?.["x-admin-password"] ?? body?.password;
-  if (!authorized(pw, password)) {
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    return send(res, 401, { error: "Wrong password" }, "no-store");
-  }
-
   const { action } = body || {};
+  if (action === "login") return login(req, res, body, password);
+
+  if (!verifyToken(bearerToken(req))) {
+    return send(res, 401, { error: "Session expired. Log in again." }, "no-store");
+  }
 
   try {
     if (action === "ping") return send(res, 200, { ok: true }, "no-store");

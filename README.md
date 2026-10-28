@@ -25,11 +25,22 @@ Simple standalone Discord giveaway bot. MIT licensed.
   refused, their entry is removed, and they sit out the next 3 giveaways.
   `/giveaway_timeout_bans` lists who is currently sitting out
 - Per-giveaway mentionable entrants role, granted on join, stripped on end
+- Optional claim window (`claim_minutes` on create): winners press **Claim Prize**
+  before a deadline or the prize is re-drawn; `/skipclaim` lets staff skip one
+- Timed bans: `/giveaway_ban`, `/giveaway_unban`, `/giveaway_ban_list`
+  (hours + reason), alongside the permanent blacklist commands
+- `/giveaway_reroll` can replace one winner (`user:`) or draw fresh ones
+- `/gw_request_time` (staff only) reports gateway/Discord latency and the Redis
+  cache legs
 - Message counts reset for everyone **in that server** when a giveaway ends.
-  They are kept in memory and written in one batched statement every 10s, so a
+  They are kept in memory and written in one batched statement every 15s, so a
   busy server does not pay a database round-trip per message
-- Turso-only storage, so restarts never lose data
-- Built-in `/health` server, so it runs on Render's free Web Service tier
+- Turso-only storage, so restarts never lose data (Redis is an optional read
+  cache only)
+- Built-in HTTP server, so it runs on Render's free Web Service tier:
+  `/health` (liveness, always 200), `/ready` (200 only once Discord is
+  connected) and an opt-in, token-protected `/metrics` (Prometheus text)
+- `LOG_FORMAT=json` for one-JSON-object-per-line logs
 
 Details: [bot/README.md](bot/README.md).
 
@@ -84,6 +95,16 @@ value every admin API request returns 503. The local `node serve.js` mock uses
 `ADMIN_PASSWORD` if supplied, otherwise a non-secret preview-only password
 (`local-preview-only`) that is not used by the deployed API.
 
+Login sends the password once (`action: "login"`) and gets back a signed token
+that lasts 8 hours; every other admin call needs `Authorization: Bearer <token>`,
+and the browser keeps only the token (in `sessionStorage`). Changing
+`ADMIN_PASSWORD` signs every session out, unless you pin the signing key with
+`ADMIN_SESSION_SECRET`. After 5 wrong passwords in 15 minutes a client is
+locked out for 15 minutes (HTTP 429 with `Retry-After`). Attempts are counted
+per client in the `admin_login_attempts` table in the same Turso database
+(created automatically, only a salted hash of the address is stored). There is
+no global cap, so keep `ADMIN_PASSWORD` long and unique.
+
 Deploy: import the repo on Vercel with **Root Directory = `dashboard`**,
 set env vars `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN` (same as the bot)
 and a strong, unique `ADMIN_PASSWORD` (required for admin access), then deploy.
@@ -98,11 +119,13 @@ python -m giveaway_bot run      # or: python app.py (from root)
 
 ## Tests
 
-No extra dependencies: both suites are plain stdlib and Node.
+Both suites use the standard test runners (`unittest` and plain Node); the bot
+tests need the optional extras CI installs (`pip install -e "bot[turso,dev,redis]"`,
+which brings `ruff` for linting). See [TESTING.md](TESTING.md).
 
 ```bash
-cd bot       && python -m unittest discover -s tests -t .   # rules, embeds, bot
-cd dashboard && node smoke.js                              # page + card shape
+cd bot       && python -W error::RuntimeWarning -m unittest discover -s tests -t .
+cd dashboard && node smoke.js                              # page, API, admin, browser
 ```
 
 The Python suite hands `Database` an in-memory SQLite connection, so the real
@@ -112,11 +135,17 @@ schema, constraints and upserts are exercised without a Turso account.
 
 | Var | Required | What |
 | --- | --- | --- |
-| `DISCORD_BOT_TOKEN` | yes | Bot token |
+| `DISCORD_BOT_TOKEN` | yes | Bot token (`DISCORD_TOKEN` is accepted as a fallback name) |
 | `TURSO_DATABASE_URL` | yes | `libsql://...` — the only database |
 | `TURSO_AUTH_TOKEN` | yes | Turso auth token |
 | `ADMIN_PASSWORD` | dashboard admin | Required to enable `/api/admin`; unset/empty disables it (503) |
+| `ADMIN_SESSION_SECRET` | no | Dashboard only. Pins the key that signs admin session tokens; by default it is derived from `ADMIN_PASSWORD` |
 | `DISCORD_GIVEAWAY_CHANNEL_ID` | no | Force all giveaways into one channel |
+| `REDIS_URL` | no | Optional short-TTL read cache. Empty = every read goes to Turso |
+| `REDIS_ENABLED` | no | `true`/`false` (default `true`); switches the cache off without clearing the URL |
+| `LOG_FORMAT` | no | `text` (default) or `json` |
+| `LOG_LEVEL` | no | `DEBUG`, `INFO` (default), `WARNING`, `ERROR`, `CRITICAL` |
+| `METRICS_TOKEN` | no | Enables `GET /metrics` (send `Authorization: Bearer <token>`); empty = no route |
 | `TICK_SECONDS` | no | Embed refresh + due checks (default 30) |
 | `EMBED_COLOR` | no | e.g. `0x7C5CFF`, `#7C5CFF` or `7C5CFF`; masked to 24 bits |
 | `DASHBOARD_URL` | no | Blue "Dashboard" link button on every giveaway message (empty = no button) |

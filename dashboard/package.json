@@ -1,8 +1,8 @@
 {
   "name": "giveaway-dashboard-api",
   "private": true,
-  "version": "0.1.0",
-  "description": "Read-only giveaway dashboard backend (Vercel, Turso). No frontend yet.",
+  "version": "0.2.0",
+  "description": "Giveaway dashboard backend and static client (Vercel, Turso)",
   "type": "module",
   "engines": {
     "node": ">=20"

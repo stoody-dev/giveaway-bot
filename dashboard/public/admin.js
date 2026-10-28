@@ -6,7 +6,9 @@ const $ = (id) => document.getElementById(id);
 const KEY = "gw_admin";
 const PAGE = 50;
 
-let password = sessionStorage.getItem(KEY) || "";
+/* The signed session token from /api/admin login. The password itself is sent
+   once, to log in, and is never stored. */
+let token = sessionStorage.getItem(KEY) || "";
 
 /** Loaded page + the totals the server reports for the whole table. */
 const state = {
@@ -29,14 +31,29 @@ const ICON_GIFT =
 /* -- transport -- */
 
 async function api(body) {
-  const res = await fetch("/api/admin", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ password, ...body }),
-  });
+  const headers = { "Content-Type": "application/json" };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const res = await fetch("/api/admin", { method: "POST", headers, body: JSON.stringify(body) });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && body.action !== "login") {
+    // Expired or invalid session: back to the login form.
+    endSession();
+    const err = new Error(data.error || "Session expired. Log in again.");
+    err.expired = true;
+    $("login-err").textContent = err.message;
+    $("login-err").hidden = false;
+    showLogin();
+    throw err;
+  }
   if (!res.ok) throw new Error(data.error || data.failed?.[0]?.error || `Request failed (${res.status})`);
   return data;
+}
+
+function endSession() {
+  token = "";
+  sessionStorage.removeItem(KEY);
+  state.selected.clear();
+  state.offset = 0;
 }
 
 /* -- chrome: status pill + toast -- */
@@ -137,8 +154,10 @@ async function load() {
     setStatus("Online", "ok");
     render();
   } catch (err) {
-    setStatus("Error", "error");
-    showError(err);
+    if (!err.expired) {
+      setStatus("Error", "error");
+      showError(err);
+    }
   } finally {
     state.busy = false;
     if (state.pending) {
@@ -259,10 +278,13 @@ async function deleteIds(ids) {
     else toast(`${data.deleted} giveaway${data.deleted === 1 ? "" : "s"} deleted`);
   } catch (err) {
     rows.forEach((r) => r.classList.remove("going"));
-    showError(err);
-    toast(err.message, "bad");
+    if (!err.expired) {
+      showError(err);
+      toast(err.message, "bad");
+    }
   } finally {
-    await load();
+    // An expired session has nothing left to reload; load() would only 401 again.
+    if (token) await load();
   }
 }
 
@@ -283,17 +305,17 @@ $("login").addEventListener("submit", async (e) => {
   e.preventDefault();
   const btn = $("unlock");
   btn.disabled = true;
-  password = $("pw").value;
   try {
-    await api({ action: "ping" });
-    sessionStorage.setItem(KEY, password);
+    const data = await api({ action: "login", password: $("pw").value });
+    token = String(data.token || "");
+    sessionStorage.setItem(KEY, token);
     $("login-err").hidden = true;
     $("pw").value = "";
     showPanel();
     setStatus("Online", "ok");
     await load();
   } catch (err) {
-    password = "";
+    token = "";
     sessionStorage.removeItem(KEY);
     const box = $("login-err");
     box.textContent = err.message;
@@ -305,10 +327,7 @@ $("login").addEventListener("submit", async (e) => {
 });
 
 $("logout").addEventListener("click", () => {
-  password = "";
-  sessionStorage.removeItem(KEY);
-  state.selected.clear();
-  state.offset = 0;
+  endSession();
   showLogin();
 });
 
@@ -358,13 +377,12 @@ $("bulk-del").addEventListener("click", async () => {
 
 /* -- boot -- */
 
-if (password) {
+if (token) {
   showPanel();
   api({ action: "ping" })
     .then(load)
     .catch(() => {
-      password = "";
-      sessionStorage.removeItem(KEY);
+      endSession();
       showLogin();
     });
 } else {

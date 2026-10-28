@@ -30,9 +30,6 @@ LIST_CACHE_TTL = 8.0
 #: Guild settings change only through the bot's own command, which clears the
 #: key, so this TTL is just a safety net for a missed invalidation.
 SETTINGS_CACHE_TTL = 10.0
-#: Giveaway-id-shaped keys are self-invalidating: a new giveaway gets a new
-#: id, so its id can never address a *different* giveaway's data.
-GW_CACHE_TTL = 6.0
 COUNT_CACHE_TTL = 4.0
 #: Longest key suffix this bot will cache. Ids are short (gw_xxxxxxxx) and an
 #: unbounded caller-supplied string would let one odd request write an
@@ -244,6 +241,14 @@ class GiveawayService:
                     log.debug("invalidation queue over cap, dropped %d oldest", overflow)
         except Exception:
             pass
+
+    def pending_invalidation_count(self) -> int:
+        """How many cache keys are queued for invalidation (for /metrics; never raises)."""
+        try:
+            with self._inval_lock:
+                return len(self._pending_invalidations)
+        except Exception:
+            return 0
 
     def drain_invalidations(self) -> list[str]:
         """Take the pending key suffixes (clearing them) for an async flush."""

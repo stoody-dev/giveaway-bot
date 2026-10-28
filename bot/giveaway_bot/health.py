@@ -13,10 +13,14 @@ UptimeRobot monitor at ``https://<your-service>.onrender.com/health`` every
 
 from __future__ import annotations
 
+import hmac
 import logging
 import sys
 import threading
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from .metrics import CONTENT_TYPE as METRICS_CONTENT_TYPE
 
 log = logging.getLogger("giveaway_bot.health")
 
@@ -40,9 +44,16 @@ class _Handler(BaseHTTPRequestHandler):
     #: exits. http.server turns a socket timeout into a closed connection.
     timeout = 10
 
-    def _respond(self, status: int, body: bytes, *, head_only: bool = False) -> None:
+    def _respond(
+        self,
+        status: int,
+        body: bytes,
+        *,
+        head_only: bool = False,
+        content_type: str = "text/plain; charset=utf-8",
+    ) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if not head_only:
@@ -83,9 +94,18 @@ class _Server(ThreadingHTTPServer):
 
 
 def start_health_server(
-    port: int, ready_state: dict | None = None
+    port: int,
+    ready_state: dict | None = None,
+    *,
+    metrics_token: str = "",
+    metrics_provider: Callable[[], str] | None = None,
 ) -> ThreadingHTTPServer:
-    """Serve /health (liveness), /ready (readiness), / (status page).
+    """Serve /health (liveness), /ready (readiness), / (status page), /metrics.
+
+    /metrics exists only when metrics_token is set (otherwise it 404s like any
+    unknown path) and needs ``Authorization: Bearer <token>``: the port is
+    public on Render. metrics_provider returns the page body; if it raises,
+    only /metrics answers 500, never /health or /ready.
 
     ready_state is an optional mutable mapping with a "status" key
     ("starting", "online", "retrying-N") plus a "discord" key ("starting",
@@ -104,10 +124,28 @@ def start_health_server(
         except Exception:
             return "starting"
 
+    metrics_on = bool(metrics_token) and metrics_provider is not None
+    expected = f"Bearer {metrics_token}".encode()
+
     class _StateHandler(_Handler):
+        def _metrics(self, *, head_only: bool) -> None:
+            supplied = (self.headers.get("Authorization") or "").encode()
+            if not hmac.compare_digest(supplied, expected):
+                self._respond(401, b"unauthorized", head_only=head_only)
+                return
+            try:
+                body = metrics_provider().encode()  # type: ignore[misc]
+            except Exception:
+                log.exception("metrics provider failed")
+                self._respond(500, b"metrics unavailable", head_only=head_only)
+                return
+            self._respond(200, body, head_only=head_only, content_type=METRICS_CONTENT_TYPE)
+
         def do_GET(self) -> None:  # noqa: N802 - http.server naming
             path = self.path.split("?", 1)[0]
-            if path == "/ready":
+            if path == "/metrics" and metrics_on:
+                self._metrics(head_only=False)
+            elif path == "/ready":
                 discord_state = _discord_state()
                 if discord_state == "online":
                     self._respond(200, b"ready: discord online")
@@ -137,7 +175,9 @@ def start_health_server(
 
         def do_HEAD(self) -> None:  # noqa: N802 - http.server naming
             path = self.path.split("?", 1)[0]
-            if path == "/ready":
+            if path == "/metrics" and metrics_on:
+                self._metrics(head_only=True)
+            elif path == "/ready":
                 if _discord_state() == "online":
                     self._respond(200, b"", head_only=True)
                 else:

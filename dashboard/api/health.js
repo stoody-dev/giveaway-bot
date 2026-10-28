@@ -8,7 +8,7 @@ export default async function handler(req, res) {
   }
   try {
     await db().execute("SELECT 1");
-    return send(res, 200, { ok: true, now: Date.now() });
+    return send(res, 200, { ok: true, now: Date.now() }, "no-store");
   } catch (err) {
     console.error("Health API error:", err);
     return send(res, 500, { ok: false, error: "Internal server error" }, "no-store");

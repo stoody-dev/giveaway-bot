@@ -34,6 +34,13 @@ def _bool(name: str, default: bool) -> bool:
     return default
 
 
+def _choice(name: str, allowed: tuple[str, ...], default: str, *, upper: bool = False) -> str:
+    """One of a fixed set of words; anything else (including empty) keeps the default."""
+    raw = (os.getenv(name, "") or "").strip()
+    raw = raw.upper() if upper else raw.lower()
+    return raw if raw in allowed else default
+
+
 def _color(name: str, default: int) -> int:
     """A colour setting as a 24-bit int, in any spelling people actually write.
 
@@ -96,6 +103,16 @@ class Settings:
     redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", "").strip())
     #: Master switch, so the cache can be dropped without editing the URL.
     redis_enabled: bool = field(default_factory=lambda: _bool("REDIS_ENABLED", True))
+    #: "text" (default, the classic one-line format) or "json" (one object per line).
+    log_format: str = field(default_factory=lambda: _choice("LOG_FORMAT", ("text", "json"), "text"))
+    log_level: str = field(
+        default_factory=lambda: _choice(
+            "LOG_LEVEL", ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"), "INFO", upper=True
+        )
+    )
+    #: Bearer token that switches on /metrics on the health port. Empty means
+    #: the route does not exist (404): the port is public on Render.
+    metrics_token: str = field(default_factory=lambda: os.getenv("METRICS_TOKEN", "").strip())
 
     @property
     def uses_turso(self) -> bool:

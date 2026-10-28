@@ -229,6 +229,37 @@ assert.strictEqual(serverCard({ ...odd, entrant_count: null }, 3, [], now).entra
 assert.strictEqual(serverCard({ ...overflowing, entrant_count: 99 }, 2, [], now).entrants.count, 2, "live count ignores snapshot");
 console.log("card edge cases ok");
 
+// -- local dev server mock (serve.js) -------------------------------------
+const { handleRequest } = await import("./serve.js");
+async function mockServe(url) {
+  const chunks = [];
+  let code = 0;
+  const headers = {};
+  const res = {
+    writeHead(c, h = {}) { code = c; Object.assign(headers, h); return this; },
+    write(c) { chunks.push(Buffer.from(c)); return true; },
+    end(c) { if (c) chunks.push(Buffer.from(c)); return this; },
+  };
+  await handleRequest({ url, method: "GET", headers: {}, [Symbol.asyncIterator]: async function* () {} }, res);
+  return { statusCode: code, headers, body: Buffer.concat(chunks).toString("utf8") };
+}
+const devHealth = await mockServe("/api/health");
+assert.strictEqual(devHealth.statusCode, 200, "serve.js /api/health is 200");
+assert.ok(JSON.parse(devHealth.body).ok, "serve.js /api/health body ok");
+assert.strictEqual(devHealth.headers["Cache-Control"], "no-store");
+
+const devGiveaways = await mockServe("/api/giveaways");
+assert.strictEqual(devGiveaways.statusCode, 200, "serve.js /api/giveaways is 200");
+assert.ok(Array.isArray(JSON.parse(devGiveaways.body).live), "serve.js returns live list");
+
+const devIndex = await mockServe("/");
+assert.strictEqual(devIndex.statusCode, 200, "serve.js serves index.html at /");
+assert.ok(devIndex.body.includes("Giveaways"), "index.html has title/content");
+
+const dev404 = await mockServe("/nonexistent-file.xyz");
+assert.strictEqual(dev404.statusCode, 404, "serve.js returns 404 on missing static file");
+console.log("serve.js mock server ok");
+
 await import("./smoke-api.js");
 await import("./smoke-browser.js");
 console.log("ALL OK");

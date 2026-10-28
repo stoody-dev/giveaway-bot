@@ -18,7 +18,11 @@ python -m giveaway_bot run
 | `TURSO_DATABASE_URL` | yes | `libsql://...` — the only database. The bot refuses to start without it |
 | `TURSO_AUTH_TOKEN` | yes | Turso auth token |
 | `DISCORD_GIVEAWAY_CHANNEL_ID` | no | Force all giveaways into one channel |
-| `TICK_SECONDS` | no | Auto-draw poll (default 30) |
+| `TICK_SECONDS` | no | Auto-draw poll (default 30, clamped to 5..3600) |
+| `REDIS_URL` / `REDIS_ENABLED` | no | Optional read cache; with it unset or down every read falls back to Turso |
+| `PORT` | no | Health server port (default 10000) |
+| `LOG_FORMAT` / `LOG_LEVEL` | no | `text`\|`json`, and the log level (default `INFO`) |
+| `METRICS_TOKEN` | no | Enables `GET /metrics` on the health port (Bearer auth); empty = no route |
 | `DASHBOARD_URL` | no | Blue "Dashboard" button link on every giveaway message (default `https://giveaway-bot-duggal.vercel.app/`) |
 
 Needs **Server Members Intent** on (Bot tab in the Developer Portal) for role checks.
@@ -34,7 +38,7 @@ Needs **Server Members Intent** on (Bot tab in the Developer Portal) for role ch
   giveaway message. Run without a role to view the current one.
   - `min_messages`: members must have sent that many messages in the server
     (counted from when the bot is online; counts are batched in memory and
-    written every ~10s, and unflushed counts still count towards the check)
+    written every ~15s, and unflushed counts still count towards the check)
   - `image`: http(s) photo URL shown on the embed — e.g. a Steam gift-card picture
 
 Message counts start accumulating the moment the bot logs in (even with no
@@ -66,6 +70,14 @@ it lacks the permission the giveaway still runs, just without the role.
   previous ones and keeping the whole list within 25 names, which is what one
   announcement can hold
 - `/giveaway_cancel giveaway_id` — same suggestions + fallback
+- `/giveaway_create ... claim_minutes` — optional claim window: each winner must
+  press **Claim Prize** before the deadline or is replaced by a fresh draw.
+  `/skipclaim` (Manage Server) skips a winner who is not going to claim
+- `/giveaway_reroll giveaway_id user:` — replace one specific winner
+- `/giveaway_ban user hours [reason]`, `/giveaway_unban user`, `/giveaway_ban_list`
+  — timed bans from joining (Manage Server), separate from the permanent blacklist
+- `/gw_request_time` — staff-only latency probe: gateway and Discord round-trips,
+  plus the Redis cache legs (cold then warm). It does not time the database
 
 **Timed-out members** (Discord's native `/mute` — read with
 `Member.is_timed_out()`, never a role called "Muted"): clicking Join while
@@ -103,5 +115,9 @@ account and no network.
 | `bot.py` | Discord wiring, buttons, timer |
 | `embeds.py` / `views.py` | Messages + Join/Leave buttons |
 | `cli.py` | `run` / `doctor` |
+| `redis_cache.py` | Optional Redis read cache: circuit breaker, op budget, locks |
+| `health.py` | `/health`, `/ready`, `/` and the opt-in `/metrics` HTTP server |
+| `metrics.py` | Prometheus text page for `/metrics` |
+| `logs.py` | Text/JSON log setup and secret redaction |
 | `views.py` | Join/Leave/Participants buttons (dynamic custom_id dispatch) |
 | `tests/` | unittest suite, run against in-memory SQLite |

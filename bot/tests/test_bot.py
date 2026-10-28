@@ -333,6 +333,26 @@ class GuildSyncTests(BotTestCase):
         self.assertTrue(asyncio.run(scenario()))
 
 
+class ReadyStateTests(BotTestCase):
+    def test_on_ready_marks_the_gateway_online(self) -> None:
+        async def scenario() -> dict:
+            self.bot.ready_state = {"status": "retrying-2", "discord": "rate-limited"}
+            self.bot._guild_cmd_cleanup_done = True
+            await self.bot.on_ready()
+            return self.bot.ready_state
+
+        state = asyncio.run(scenario())
+        self.assertEqual(state["status"], "online")
+        self.assertEqual(state["discord"], "online")
+
+    def test_on_ready_without_a_state_dict_is_fine(self) -> None:
+        async def scenario() -> None:
+            self.bot._guild_cmd_cleanup_done = True
+            await self.bot.on_ready()
+
+        asyncio.run(scenario())
+
+
 class RoleTaskTests(BotTestCase):
     def test_scheduled_deletes_are_kept_alive_and_deduplicated(self) -> None:
         async def scenario() -> tuple[int, int, int]:
@@ -1517,6 +1537,53 @@ class LoginRetryTests(unittest.TestCase):
             return str((captured.get("state") or {}).get("discord"))
 
         self.assertEqual(asyncio.run(scenario()), "rate-limited")
+
+    def test_amain_does_not_mark_online_before_the_gateway_is_ready(self) -> None:
+        """/ready stays 503 until on_ready: entering the bot is not being logged in."""
+        async def scenario() -> dict:
+            seen: dict = {}
+            captured: dict = {}
+
+            class FakeBot:
+                def __init__(self, ready_state):
+                    self.ready_state = ready_state
+
+                async def __aenter__(self):
+                    seen["on_enter"] = dict(self.ready_state)
+                    return self
+
+                async def __aexit__(self, *args):
+                    pass
+
+                async def start(self, token):
+                    seen["during_start"] = dict(self.ready_state)
+                    # What discord.py does once the gateway is up.
+                    self.ready_state["status"] = "online"
+                    self.ready_state["discord"] = "online"
+
+                async def close(self):
+                    pass
+
+            def capture_server(port: int, ready_state: dict | None = None, **kwargs):
+                captured["state"] = ready_state
+                return SimpleNamespace()
+
+            loop = asyncio.get_running_loop()
+            with (patch("giveaway_bot.health.start_health_server", side_effect=capture_server),
+                  patch("giveaway_bot.bot.Database",
+                        return_value=SimpleNamespace(init_schema=lambda: None)),
+                  patch("giveaway_bot.bot.GiveawayBot",
+                        side_effect=lambda *a, **kw: FakeBot(kw.get("ready_state"))),
+                  patch("giveaway_bot.bot.wire_commands"),
+                  patch.object(loop, "add_signal_handler")):
+                await amain(Settings(bot_token=uuid.uuid4().hex, turso_url=""))
+            seen["after"] = dict(captured["state"])
+            return seen
+
+        seen = asyncio.run(scenario())
+        self.assertEqual(seen["on_enter"]["discord"], "starting")
+        self.assertEqual(seen["during_start"]["discord"], "starting")
+        self.assertEqual(seen["after"]["discord"], "online")
 
 
 class JoinFastPathTests(BotTestCase):

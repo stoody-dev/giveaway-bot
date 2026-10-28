@@ -34,3 +34,9 @@ services:
       # Turso. Never a source of truth -- it only cuts repeat reads.
       - key: REDIS_URL
         sync: false
+      # Optional. Setting it enables GET /metrics (Authorization: Bearer <token>).
+      - key: METRICS_TOKEN
+        sync: false
+      # "text" (default) or "json" for log indexers.
+      - key: LOG_FORMAT
+        value: text

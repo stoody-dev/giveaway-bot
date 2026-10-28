@@ -4,6 +4,9 @@ import admin from "./api/admin.js";
 import giveaways from "./api/giveaways.js";
 import health from "./api/health.js";
 import { db } from "./api/_lib/turso.js";
+import {
+  LOCK_MS, MAX_FAILS, SESSION_TTL_MS, resetForTests, signToken, verifyToken,
+} from "./api/_lib/adminAuth.js";
 
 const saved = {
   password: process.env.ADMIN_PASSWORD,
@@ -15,7 +18,7 @@ const restore = (key, value) => {
   else process.env[key] = value;
 };
 
-async function request(handler, method = "GET", body = {}, query = {}) {
+async function request(handler, method = "GET", body = {}, query = {}, headers = {}) {
   const res = {
     headers: {}, statusCode: 0, body: null,
     setHeader(key, value) { this.headers[key.toLowerCase()] = value; },
@@ -23,13 +26,18 @@ async function request(handler, method = "GET", body = {}, query = {}) {
     json(value) { this.body = value; return this; },
     end() { return this; },
   };
-  await handler({ method, body, query, headers: {} }, res);
+  await handler({ method, body, query, headers }, res);
   return res;
 }
-const post = (body) => request(admin, "POST", { password: "smoke-test-only", ...body });
+// Every admin action except login needs a signed session token.
+const authed = () => ({ authorization: `Bearer ${signToken()}` });
+const post = (body) => request(admin, "POST", body, {}, authed());
+const login = (password, ip = "203.0.113.7") =>
+  request(admin, "POST", { action: "login", password }, {}, { "x-forwarded-for": ip });
 
 try {
   delete process.env.ADMIN_PASSWORD;
+  delete process.env.ADMIN_SESSION_SECRET;
   delete process.env.TURSO_DATABASE_URL;
   delete process.env.TURSO_AUTH_TOKEN;
   for (const method of ["POST", "OPTIONS", "GET"]) {
@@ -38,23 +46,58 @@ try {
     assert.deepEqual(disabled.body, { error: "Admin disabled: ADMIN_PASSWORD not set" });
   }
   process.env.ADMIN_PASSWORD = "smoke-test-only";
-  assert.equal((await post({ action: "ping" })).statusCode, 200);
-  const wrong = await request(admin, "POST", { action: "ping", password: "x".repeat(100) });
-  assert.equal(wrong.statusCode, 401, "different password lengths reject safely");
-  assert.equal(wrong.body.error, "Wrong password");
-  console.log("admin authentication/disabled ok");
+
+  // Session tokens: signed, expiring, tied to the password.
+  assert.equal((await post({ action: "ping" })).statusCode, 200, "valid token accepted");
+  const good = signToken();
+  assert.equal(verifyToken(good), true);
+  assert.equal(verifyToken(signToken(Date.now() - SESSION_TTL_MS - 1000)), false, "expired token rejected");
+  const [payload, sig] = good.split(".");
+  const flipped = sig.slice(0, -1) + (sig.endsWith("A") ? "B" : "A");
+  assert.equal(verifyToken(`${payload}.${flipped}`), false, "tampered signature rejected");
+  const forgedBody = Buffer.from(JSON.stringify({ iat: 0, exp: Date.now() + 1e9 })).toString("base64url");
+  assert.equal(verifyToken(`${forgedBody}.${sig}`), false, "tampered payload rejected");
+  for (const junk of ["", "abc", "a.b.c", undefined, null, 42, ".", `${payload}.`]) {
+    assert.equal(verifyToken(junk), false, `junk token ${String(junk)}`);
+  }
+  for (const headers of [{}, { authorization: "Bearer nope" }, { authorization: good }, { "x-admin-password": "smoke-test-only" }]) {
+    const denied = await request(admin, "POST", { action: "ping", password: "smoke-test-only" }, {}, headers);
+    assert.equal(denied.statusCode, 401, "password per request no longer authorizes");
+  }
+  process.env.ADMIN_PASSWORD = "another-password";
+  assert.equal(verifyToken(good), false, "changing the password signs sessions out");
+  process.env.ADMIN_SESSION_SECRET = "pinned-secret";
+  const pinned = signToken();
+  process.env.ADMIN_PASSWORD = "smoke-test-only";
+  assert.equal(verifyToken(pinned), true, "a pinned secret survives a password change");
+  delete process.env.ADMIN_SESSION_SECRET;
+  console.log("admin session tokens ok");
+
+  // Login with no database configured: the limiter fails closed, loudly in the log only.
+  const originalLoginError = console.error;
+  const loginLogged = [];
+  console.error = (...args) => loginLogged.push(args);
+  try {
+    const down = await login("smoke-test-only");
+    assert.equal(down.statusCode, 503);
+    assert.equal(down.body.error, "Login temporarily unavailable");
+    assert.equal(loginLogged.length, 1);
+  } finally {
+    console.error = originalLoginError;
+  }
+  console.log("admin login fails closed ok");
 
   // Missing database configuration and internal errors never disclose details to callers.
   const originalError = console.error;
   const logged = [];
   console.error = (...args) => logged.push(args);
   try {
-    for (const [handler, method, body] of [
-      [admin, "POST", { action: "list", password: "smoke-test-only" }],
+    for (const [handler, method, body, headers] of [
+      [admin, "POST", { action: "list" }, authed()],
       [giveaways, "GET", {}],
       [health, "GET", {}],
     ]) {
-      const response = await request(handler, method, body);
+      const response = await request(handler, method, body, {}, headers);
       assert.equal(response.statusCode, 500);
       assert.equal(response.body.error, "Internal server error");
     }
@@ -66,6 +109,46 @@ try {
 
   process.env.TURSO_DATABASE_URL = "file::memory:";
   const client = db();
+  resetForTests();
+
+  // Login rate limiting, per client, stored in Turso.
+  const ok = await login("smoke-test-only");
+  assert.equal(ok.statusCode, 200);
+  assert.equal(verifyToken(ok.body.token), true, "login returns a verifiable token");
+  assert.ok(ok.body.expires_at > Date.now());
+  const wrongLong = await login("x".repeat(100));
+  assert.equal(wrongLong.statusCode, 401, "different password lengths reject safely");
+  assert.equal(wrongLong.body.error, "Wrong password");
+  await login("smoke-test-only"); // success clears the failure above
+  for (let n = 1; n < MAX_FAILS; n++) assert.equal((await login("bad")).statusCode, 401);
+  const locking = await login("bad");
+  assert.equal(locking.statusCode, 429, "the failure that reaches the limit locks the client");
+  assert.ok(Number(locking.headers["retry-after"]) > 0 && Number(locking.headers["retry-after"]) <= LOCK_MS / 1000);
+  const whileLocked = await login("smoke-test-only");
+  assert.equal(whileLocked.statusCode, 429, "a locked client cannot log in even with the right password");
+  assert.equal((await login("smoke-test-only", "198.51.100.9")).statusCode, 200, "other clients are unaffected");
+  assert.equal((await post({ action: "ping" })).statusCode, 200, "an open session is not affected by a lockout");
+  const stored = (await client.execute("SELECT * FROM admin_login_attempts")).rows;
+  assert.ok(stored.every((r) => !JSON.stringify(r).includes("203.0.113.7")), "raw addresses are never stored");
+  await client.execute({ sql: "UPDATE admin_login_attempts SET locked_until = ?", args: [Date.now() - 1] });
+  assert.equal((await login("smoke-test-only")).statusCode, 200, "the lock expires");
+  assert.equal((await client.execute("SELECT COUNT(*) AS n FROM admin_login_attempts WHERE fails >= 1")).rows[0].n, 0,
+    "a good login resets the client's counter");
+  console.log("admin login rate limiting ok");
+
+  // Health API: 200 with no-store on GET/HEAD, 405 on POST
+  const healthGet = await request(health, "GET");
+  assert.equal(healthGet.statusCode, 200);
+  assert.equal(healthGet.body.ok, true);
+  assert.equal(healthGet.headers["cache-control"], "no-store");
+  const healthHead = await request(health, "HEAD");
+  assert.equal(healthHead.statusCode, 200);
+  assert.equal(healthHead.headers["cache-control"], "no-store");
+  const healthPost = await request(health, "POST");
+  assert.equal(healthPost.statusCode, 405);
+  assert.equal(healthPost.headers["cache-control"], "no-store");
+  console.log("health API ok");
+
   await client.execute(
     "CREATE TABLE simple_giveaways (id TEXT PRIMARY KEY, guild_id TEXT, prize TEXT, " +
     "winner_count INTEGER, created_at INTEGER, ends_at INTEGER, ended_at INTEGER, " +

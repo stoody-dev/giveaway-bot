@@ -26,8 +26,8 @@ python -m venv .venv
 # Upgrade pip
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 
-# Install bot dependencies (including Turso/libsql and Ruff)
-.\.venv\Scripts\pip.exe install -e "bot[turso,dev]"
+# Install bot dependencies (Turso/libsql, Redis client and Ruff - same as CI)
+.\.venv\Scripts\pip.exe install -e "bot[turso,dev,redis]"
 .\.venv\Scripts\pip.exe install -r requirements.txt
 ```
 
@@ -36,7 +36,7 @@ python -m venv .venv
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install -e "bot[turso,dev]"
+pip install -e "bot[turso,dev,redis]"
 pip install -r requirements.txt
 ```
 
@@ -47,19 +47,29 @@ pip install -r requirements.txt
 The test suite uses standard-library `unittest` with an in-memory SQLite backend that executes the exact SQL queries, indexes, migrations, and constraints used in production. **No Turso account, network access, or Discord tokens are required to run the automated tests.**
 
 ### 3.1 Full Test Suite Run
-Run all 377 automated tests with strict warning checking:
+Run the whole suite with strict warning checking. This is exactly what CI runs, from the `bot/` directory:
 
 **Windows (PowerShell)**:
 ```powershell
-& .\.venv\Scripts\python.exe -W error::RuntimeWarning -m unittest discover -s bot/tests -t bot
+cd bot
+& ..\.venv\Scripts\python.exe -W error::RuntimeWarning -m unittest discover -s tests -t .
 ```
 
 **Linux / macOS (Bash)**:
 ```bash
-./.venv/bin/python -W error::RuntimeWarning -m unittest discover -s bot/tests -t bot
+cd bot
+../.venv/bin/python -W error::RuntimeWarning -m unittest discover -s tests -t .
+```
+
+The dashboard has its own offline suite (needs Node >= 20):
+```bash
+cd dashboard
+node build-page.js && git diff --exit-code -- api/page.js   # baked page is fresh
+node smoke.js
 ```
 
 ### 3.2 Running Specific Test Modules
+Run these from the repository root; the `-t bot` top-level directory makes the package imports resolve.
 ```powershell
 # Core giveaway rules, claims, entries, and persistence
 & .\.venv\Scripts\python.exe -m unittest discover -s bot/tests -p "test_service.py" -t bot
@@ -76,8 +86,14 @@ Run all 377 automated tests with strict warning checking:
 # Redis-Turso integration and fallback
 & .\.venv\Scripts\python.exe -m unittest discover -s bot/tests -p "test_redis_integration.py" -t bot
 
-# HTTP health and readiness server
+# HTTP health, readiness and /metrics server
 & .\.venv\Scripts\python.exe -m unittest discover -s bot/tests -p "test_health.py" -t bot
+
+# Prometheus page rendering
+& .\.venv\Scripts\python.exe -m unittest discover -s bot/tests -p "test_metrics.py" -t bot
+
+# Log formatting, secret redaction and log settings
+& .\.venv\Scripts\python.exe -m unittest discover -s bot/tests -p "test_logs.py" -t bot
 
 # CLI subcommands (doctor, run, --version)
 & .\.venv\Scripts\python.exe -m unittest discover -s bot/tests -p "test_cli.py" -t bot
@@ -103,10 +119,7 @@ The project uses `ruff` for linting, syntax checking, and code style validation.
 & .\.venv\Scripts\ruff.exe check bot
 ```
 
-### 4.2 Run Ruff Format Check
-```powershell
-& .\.venv\Scripts\ruff.exe format --check bot
-```
+`ruff format` is not enforced: the existing code was not written to its style, so a format check would fail on many files. CI runs `ruff check` only.
 
 ---
 

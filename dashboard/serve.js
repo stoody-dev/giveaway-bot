@@ -3,11 +3,14 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { extname, join } from "node:path";
+import { extname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const PUB = new URL("./public/", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
 const DEV_PASSWORD = process.env.ADMIN_PASSWORD || "local-preview-only";
+// The preview mock hands out one fixed token; the real API signs expiring ones.
+const DEV_TOKEN = "local-preview-token";
 
 const now = Date.now();
 const sample = {
@@ -48,8 +51,12 @@ const sample = {
   ],
 };
 
-createServer(async (req, res) => {
+export async function handleRequest(req, res) {
   const path = new URL(req.url, "http://x").pathname;
+  if (path === "/api/health") {
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    return res.end(JSON.stringify({ ok: true, now: Date.now() }));
+  }
   if (path === "/api/giveaways") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify(sample));
@@ -67,11 +74,17 @@ createServer(async (req, res) => {
       res.writeHead(code, { "Content-Type": "application/json" });
       res.end(JSON.stringify(obj));
     };
-    const supplied = createHash("sha256").update(String(body.password ?? "")).digest();
-    const expected = createHash("sha256").update(DEV_PASSWORD).digest();
-    if (!timingSafeEqual(supplied, expected)) {
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      return json(401, { error: "Wrong password" });
+    if (body.action === "login") {
+      const supplied = createHash("sha256").update(String(body.password ?? "")).digest();
+      const expected = createHash("sha256").update(DEV_PASSWORD).digest();
+      if (!timingSafeEqual(supplied, expected)) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        return json(401, { error: "Wrong password" });
+      }
+      return json(200, { token: DEV_TOKEN, expires_at: Date.now() + 8 * 3600_000 });
+    }
+    if (req.headers.authorization !== `Bearer ${DEV_TOKEN}`) {
+      return json(401, { error: "Session expired. Log in again." });
     }
     if (body.action === "list") {
       const offset = Number(body.offset) || 0;
@@ -100,4 +113,11 @@ createServer(async (req, res) => {
   } catch {
     res.writeHead(404).end("not found");
   }
-}).listen(4321, () => console.log("http://localhost:4321"));
+}
+
+export const server = createServer(handleRequest);
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (isMain) {
+  server.listen(4321, () => console.log("http://localhost:4321"));
+}
